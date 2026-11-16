@@ -25,9 +25,21 @@ The Vulkan core of mruby-gpu-narray now lives here: device and queue setup, buff
 
 Progress is tracked in the [GitHub Project](https://github.com/users/yujiteshima/projects/3).
 
+## Depending on it
+
+mruby-gpu-narray builds on this gem, and mruby-gpu-kernel and the coming image and camera gems will too. Until this gem is on mgem-list, such a gem names the GitHub repository and the branch in its `mrbgem.rake`:
+
+```ruby
+spec.add_dependency 'mruby-gpu-runtime', github: 'yujiteshima/mruby-gpu-runtime', branch: 'main'
+```
+
+Keep `branch: 'main'`. Without it, mruby clones `master`, which this repository does not have, and the build stops.
+
+mruby reads this line only when the build configuration does not list mruby-gpu-runtime itself. A build that lists it by path never fetches it, so a wrong line goes unnoticed there. Check the line once with a build configuration that leaves mruby-gpu-runtime out, as mruby-gpu-narray's CI does.
+
 ## Build and test
 
-Gems that depend on this one (mruby-gpu-narray) fetch it from GitHub during the build. To build it on its own, add it to `build_config.rb`:
+To build this gem on its own, add it to `build_config.rb`:
 
 ```ruby
 MRuby::Build.new do |conf|
