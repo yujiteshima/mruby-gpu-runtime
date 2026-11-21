@@ -1,7 +1,7 @@
 # CI for an mruby GPU gem, on Mesa lavapipe.
 #
 # This file is a template. To use it in another GPU gem, copy it and change the
-# three values under "Inputs". docs/ci-template.md in mruby-gpu-runtime has the
+# values under "Inputs". docs/ci-template.md in mruby-gpu-runtime has the
 # details.
 name: CI
 
@@ -27,6 +27,21 @@ env:
   # output must be "ALL TESTS PASSED" when every test passes.
   TEST_FILE: test/runtime_test.rb
 
+  # Whether this gem's own suite fails when the test script prints a line that
+  # starts with "SKIP". 'true' here, because the script skips the C API tests
+  # in a build without test/capi, and CI must not pass without them. Set it to
+  # 'false' if your script skips tests on purpose on lavapipe. The DOWNSTREAM
+  # suites never check this: their scripts belong to other gems.
+  FAIL_ON_SKIP: 'true'
+
+  # Test-only gems inside this repository: directories relative to the
+  # repository root, separated by spaces. Every suite lists them in the build
+  # configuration by path, right after this checkout. Here, test/capi gives
+  # test/runtime_test.rb a way to call the C API.
+  #
+  # Leave it empty (TEST_GEMS: '') when the gem has none.
+  TEST_GEMS: test/capi
+
   # Gems that build on this one. Each line adds one suite, which builds those
   # gems on top of this checkout and runs their tests, so a change here that
   # breaks them shows up before it is merged. The format of a line is:
@@ -34,8 +49,8 @@ env:
   #   <suite name> <test file> <owner/repository@branch> [<owner/repository@branch> ...]
   #
   # - The repositories are cloned and listed in the build configuration by
-  #   path, in the order given, after this checkout. List a gem after the gems
-  #   it depends on.
+  #   path, in the order given, after this checkout and TEST_GEMS. List a gem
+  #   after the gems it depends on.
   # - The test file is relative to the root of the last repository on the line.
   # - Always name the branch.
   #
@@ -128,6 +143,13 @@ jobs:
             echo "  toolchain :gcc"
             echo "  conf.gembox 'default'"
             echo "  conf.gem '$GITHUB_WORKSPACE'"
+            for gem in $TEST_GEMS; do
+              if [ ! -f "$GITHUB_WORKSPACE/$gem/mrbgem.rake" ]; then
+                echo "::error::TEST_GEMS: $gem has no mrbgem.rake" >&2
+                exit 1
+              fi
+              echo "  conf.gem '$GITHUB_WORKSPACE/$gem'"
+            done
             for spec in $SUITE_REPOS; do
               repo=${spec%%@*}
               echo "  conf.gem '$RUNNER_TEMP/gems/${repo##*/}'"
@@ -162,3 +184,8 @@ jobs:
           echo "$SUITE_NAME, mruby $MRUBY_VERSION, $RUNNER_ARCH: $(grep -E '^[0-9]+ tests, ' "$RUNNER_TEMP/test.log" | tail -1)" >> "$GITHUB_STEP_SUMMARY"
           # The test script prints a summary but exits 0 either way, so check its last line.
           grep -qx 'ALL TESTS PASSED' "$RUNNER_TEMP/test.log"
+          # This gem's own suite must not leave tests out (see FAIL_ON_SKIP).
+          if [ -z "$SUITE_REPOS" ] && [ "$FAIL_ON_SKIP" = true ] && grep -q '^SKIP' "$RUNNER_TEMP/test.log"; then
+            echo "::error::$SUITE_TEST skipped tests: $(grep -m1 '^SKIP' "$RUNNER_TEMP/test.log")"
+            exit 1
+          fi

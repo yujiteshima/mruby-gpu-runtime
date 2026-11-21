@@ -15,20 +15,22 @@ Every suite runs on every mruby version and runner. Each job:
 1. installs the toolchain, the Vulkan loader, lavapipe, `glslangValidator` and `vulkaninfo`
 2. prints the Vulkan device (`vulkaninfo --summary`), so the log shows that lavapipe was used
 3. clones the downstream gems, if the suite has any
-4. builds mruby with the `default` gembox, this checkout, and the downstream gems
-5. runs the test script and fails unless its output has the line `ALL TESTS PASSED`
+4. builds mruby with the `default` gembox, this checkout, the gems in `TEST_GEMS`, and the downstream gems
+5. runs the test script and fails unless its output has the line `ALL TESTS PASSED`; the gem's own suite also fails on a `SKIP` line, unless `FAIL_ON_SKIP` is `'false'`
 
 The job summary shows the test counts of each job.
 
 ## How to copy it
 
 1. Copy `.github/workflows/ci.yml` to the same path in your gem.
-2. Change the three values under `Inputs`, near the top of the file:
+2. Change the values under `Inputs`, near the top of the file:
 
    | Input | Meaning | Value in this repository |
    |---|---|---|
    | `GEM_NAME` | the name in your `mrbgem.rake` | `mruby-gpu-runtime` |
    | `TEST_FILE` | your test script, relative to the repository root | `test/runtime_test.rb` |
+   | `FAIL_ON_SKIP` | whether your own suite fails when the test script prints a `SKIP` line | `'true'` |
+   | `TEST_GEMS` | test-only gems inside your repository, listed in every suite | `test/capi` |
    | `DOWNSTREAM` | the gems that build on yours, one suite per line | mruby-gpu-narray and mruby-gpu-kernel |
 
 3. Nothing else needs to change. The matrix of mruby versions and runners is in the `test` job, if you need a different one.
@@ -39,6 +41,18 @@ The workflow does not use the exit status of the test script. It checks the outp
 
 To show the test counts in the job summary, also print a line that starts with `<number> tests, `, for example `14 tests, 14 passed, 0 failed`.
 
+### `FAIL_ON_SKIP`
+
+A test script can leave tests out and still print `ALL TESTS PASSED`. `test/runtime_test.rb` does this for the C API tests in a build without `test/capi`, and prints a line that starts with `SKIP`. With `FAIL_ON_SKIP: 'true'`, the gem's own suite fails when the output has such a line, so the CI cannot pass without those tests.
+
+Set it to `'false'` if your script skips tests on purpose on lavapipe, for example a test that needs a limit lavapipe does not have. The `DOWNSTREAM` suites never check for `SKIP` lines, because their scripts belong to other gems.
+
+### `TEST_GEMS`
+
+Gems that exist only for the tests and live inside your repository: directories relative to the repository root, separated by spaces. Each must have an `mrbgem.rake`. Every suite, the downstream ones too, lists them in the build configuration by path, right after your checkout.
+
+This repository uses `TEST_GEMS: test/capi`. That gem gives `test/runtime_test.rb` a way to call the C API, and building it in every suite shows that it builds next to the downstream gems. A gem with no test-only gems sets `TEST_GEMS: ''`.
+
 ### `DOWNSTREAM`
 
 Each line adds one suite. A suite builds other gems on top of your checkout and runs their tests, so a change that breaks them shows up in your pull request, before it is merged.
@@ -48,7 +62,7 @@ Each line adds one suite. A suite builds other gems on top of your checkout and 
 ```
 
 - The suite name appears in the job name.
-- The repositories are cloned from GitHub and listed in the build configuration by path, in the order given, after your checkout. List a gem after the gems it depends on.
+- The repositories are cloned from GitHub and listed in the build configuration by path, in the order given, after your checkout and `TEST_GEMS`. List a gem after the gems it depends on.
 - The test file is relative to the root of the last repository on the line. The test runs from that directory.
 - Always name the branch.
 
