@@ -73,6 +73,21 @@ assert_raise("unknown sync mode -> ArgumentError", ArgumentError) { GPU.sync_mod
 assert_true("a rejected mode leaves the mode unchanged", GPU.sync_mode == :deferred,
             GPU.sync_mode.inspect)
 
+# ---- the exception classes ----
+assert_true("GPU::Error is a StandardError", GPU::Error.superclass == StandardError,
+            GPU::Error.superclass.inspect)
+[GPU::DeviceError, GPU::OutOfMemoryError, GPU::UnsupportedError, GPU::CompileError].each do |c|
+  assert_true("#{c} is a GPU::Error", c.superclass == GPU::Error, c.superclass.inspect)
+end
+assert_true("GPU::ShapeError is an ArgumentError", GPU::ShapeError.superclass == ArgumentError,
+            GPU::ShapeError.superclass.inspect)
+assert_raise("rescue GPU::Error catches a subclass", GPU::Error) { raise GPU::DeviceError, "lost" }
+assert_raise("rescue StandardError catches GPU::Error", StandardError) { raise GPU::Error, "x" }
+assert_true("a GPU::Error is not a RuntimeError or an ArgumentError",
+            !(GPU::Error <= RuntimeError) && !(GPU::Error <= ArgumentError))
+assert_true("a bad argument is not a GPU::Error",
+            begin; GPU.sync_mode = :later; rescue GPU::Error; false; rescue ArgumentError; true; end)
+
 # ---- the C API, through test/capi ----
 if Object.const_defined?(:GPURuntimeTest)
   T = GPURuntimeTest
@@ -198,11 +213,37 @@ if Object.const_defined?(:GPURuntimeTest)
                        "storage buffers") { T.create_pipeline(4, 4, 0, true) }
   assert_raise_message("more push constants than the runtime has -> ArgumentError", ArgumentError,
                        "push constants") { T.create_pipeline(1, 20, 0, false) }
-  assert_raise_message("SPIR-V that is not whole words -> RuntimeError naming the pipeline",
-                       RuntimeError, "probe", "SPIR-V", "VkResult") { T.create_pipeline(1, 4, 13, false) }
+  assert_raise_message("SPIR-V that is not whole words -> GPU::CompileError naming the pipeline",
+                       GPU::CompileError, "probe", "SPIR-V", "VkResult") { T.create_pipeline(1, 4, 13, false) }
   rep = T.create_pipeline(1, 4, 13, true)
   assert_true("the same, reported through error_out", rep.is_a?(Array) && rep[0].include?("SPIR-V") &&
               rep[1].is_a?(String) && rep[2] == 0, rep.inspect)
+  assert_true("error_out carries the kind, and it is the class that was raised",
+              T.error_class(rep[3]) == GPU::CompileError, rep.inspect)
+
+  # -- errors --
+  kinds = T.error_kinds
+  { generic: GPU::Error, device: GPU::DeviceError, out_of_memory: GPU::OutOfMemoryError,
+    unsupported: GPU::UnsupportedError, compile: GPU::CompileError, shape: GPU::ShapeError }.each do |k, c|
+    assert_true("gpu_rt_error_class(#{k}) is #{c}", T.error_class(kinds[k]) == c,
+                T.error_class(kinds[k]).inspect)
+  end
+  assert_true("an unknown kind is GPU::Error",
+              T.error_class(kinds[:count]) == GPU::Error && T.error_class(-1) == GPU::Error)
+  assert_raise_message("a gem raises GPU::ShapeError through gpu_rt_error_class", GPU::ShapeError,
+                       "shape mismatch: 3 vs 4") { T.raise_error(kinds[:shape], 3, 4) }
+  assert_raise("and rescue ArgumentError still catches it", ArgumentError) { T.raise_error(kinds[:shape], 3, 4) }
+  assert_raise("a gem raises GPU::UnsupportedError, caught as GPU::Error", GPU::Error) do
+    T.raise_error(kinds[:unsupported], 0, 0)
+  end
+
+  # A buffer no device can provide: 2**50 bytes is past any address space, and
+  # small enough that no driver's size arithmetic wraps around.
+  assert_raise_message("a buffer the device cannot provide -> GPU::OutOfMemoryError",
+                       GPU::OutOfMemoryError, "creating a buffer", "failed", "VkResult -") do
+    B.with_usage(1 << 50, 1)
+  end
+  assert_true("and the device works after it", B.floats(2).write([1, 2]).read == [1.0, 2.0])
 
   # -- dispatches that do not fit the pipeline --
   GPU.sync

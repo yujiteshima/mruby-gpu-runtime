@@ -59,6 +59,10 @@
  *    in that case, and returns no error code. Whatever the caller allocated
  *    and the GC does not own must be released before the call.
  *    gpu_rt_pipeline_create() can report instead of raising; see there.
+ *  - What the device, the driver or a shader does wrong is raised as GPU::Error
+ *    or one of its subclasses; see "Errors" below. A mistake in a call (a NULL
+ *    description, a dispatch that does not fit its pipeline) is an
+ *    ArgumentError or a TypeError.
  *  - A descriptor struct (gpu_rt_buffer_desc, gpu_rt_layout,
  *    gpu_rt_dispatch_desc) is passed by pointer and read during the call
  *    only. Fill it with designated initializers: a member this header gains
@@ -118,9 +122,10 @@ typedef struct gpu_rt_pipeline gpu_rt_pipeline;  /* a compute shader ready to di
 
 /* The context of this mruby. The first call starts Vulkan (instance, device,
  * queue), so a program that never touches the GPU never pays for it; later
- * calls only return the handle. Raises if there is no usable device. The
- * handle is valid until the mruby state is closed, and must not be kept
- * across that. */
+ * calls only return the handle. Raises GPU::DeviceError if there is no usable
+ * device (GPU::OutOfMemoryError or GPU::UnsupportedError when the VkResult
+ * says so). The handle is valid until the mruby state is closed, and must not
+ * be kept across that. */
 gpu_rt_context *gpu_rt_context_get(mrb_state *mrb);
 
 /* Whether the context has been started. Never starts it and never raises. */
@@ -168,8 +173,8 @@ typedef struct gpu_rt_buffer_desc {
 } gpu_rt_buffer_desc;
 
 /* Create a buffer. Its contents are undefined until written. The host can
- * always map it. Raises ArgumentError for a bad description and RuntimeError
- * when the device cannot provide the memory.
+ * always map it. Raises ArgumentError for a bad description and
+ * GPU::OutOfMemoryError when the device cannot provide the memory.
  *
  * The caller owns the returned buffer until it passes it to
  * gpu_rt_buffer_wrap() or gpu_rt_buffer_release(). Do one of them before
@@ -204,7 +209,7 @@ size_t gpu_rt_buffer_size(mrb_state *mrb, gpu_rt_buffer *buf);
 /* Map the buffer into host memory, for reading and writing gpu_rt_buffer_size()
  * bytes. Recorded dispatches that touch this buffer are run and waited for
  * first, so the bytes are the current ones. Never returns NULL; raises
- * RuntimeError when the mapping fails. Unmap before the next dispatch that
+ * GPU::Error (GPU::OutOfMemoryError as a rule) when the mapping fails. Unmap before the next dispatch that
  * uses the buffer, and do not map a buffer twice. The pointer of an empty
  * buffer must not be dereferenced. */
 void *gpu_rt_buffer_map(mrb_state *mrb, gpu_rt_buffer *buf);
@@ -227,11 +232,53 @@ typedef struct gpu_rt_layout {
    * struct with runtime#3. */
 } gpu_rt_layout;
 
+/* ---- Errors ----
+ *
+ * The exception classes of every GPU gem. The runtime defines them, so they
+ * exist before any other GPU gem is initialised:
+ *
+ *   StandardError
+ *     GPU::Error                 anything the GPU side does wrong
+ *       GPU::DeviceError         no usable device, initialisation failed, device lost
+ *       GPU::OutOfMemoryError    host or device memory, or another resource, ran out
+ *       GPU::UnsupportedError    the device lacks an extension, a feature or a format
+ *       GPU::CompileError        a shader could not be made into a pipeline
+ *     ArgumentError
+ *       GPU::ShapeError          arrays whose sizes or shapes do not fit the operation
+ *
+ * GPU::ShapeError is an ArgumentError and not a GPU::Error: it is the
+ * caller's mistake, and `rescue ArgumentError` keeps catching it.
+ *
+ * The runtime chooses the class of a failed Vulkan call from its VkResult
+ * (the table is in README.md, "Errors"), and its message names the operation,
+ * the Vulkan call and the VkResult. */
+typedef enum gpu_rt_error_kind {
+  GPU_RT_ERROR_GENERIC = 0,     /* GPU::Error */
+  GPU_RT_ERROR_DEVICE,          /* GPU::DeviceError */
+  GPU_RT_ERROR_OUT_OF_MEMORY,   /* GPU::OutOfMemoryError */
+  GPU_RT_ERROR_UNSUPPORTED,     /* GPU::UnsupportedError */
+  GPU_RT_ERROR_COMPILE,         /* GPU::CompileError */
+  GPU_RT_ERROR_SHAPE,           /* GPU::ShapeError */
+  GPU_RT_ERROR_KIND_COUNT
+} gpu_rt_error_kind;
+
+/* The exception class of a kind, for a gem that raises one itself:
+ *
+ *   mrb_raisef(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_SHAPE),
+ *              "shape mismatch: %d vs %d", (int)n, (int)m);
+ *
+ * An unknown kind gives GPU::Error. Does not start the device. */
+struct RClass *gpu_rt_error_class(mrb_state *mrb, gpu_rt_error_kind kind);
+
 /* Why gpu_rt_pipeline_create() failed. */
 typedef struct gpu_rt_error {
   const char *operation;   /* the step that failed, e.g. "creating the compute pipeline" */
   const char *reason;      /* in words, e.g. "out of device memory" */
   int32_t     vk_result;   /* the VkResult, or 0 when the failure is not Vulkan's */
+  gpu_rt_error_kind kind;  /* what the runtime would have raised: pass it to
+                            * gpu_rt_error_class(). GPU_RT_ERROR_COMPILE unless
+                            * the VkResult says memory, the device or a missing
+                            * feature. */
 } gpu_rt_error;
 
 /* Create a compute pipeline from `spirv_size` bytes of SPIR-V with the entry
@@ -242,8 +289,9 @@ typedef struct gpu_rt_error {
  * SPIR-V the device does not accept is an expected failure, and gems want to
  * say different things about it, so the caller chooses:
  *
- *  - `error_out` is NULL: raises RuntimeError naming the label, the failed
- *    step and the VkResult.
+ *  - `error_out` is NULL: raises GPU::CompileError, or the GPU::Error subclass
+ *    the VkResult stands for, naming the label, the failed step and the
+ *    VkResult.
  *  - `error_out` is not NULL: returns NULL and fills `*error_out`. On success
  *    `*error_out` is zeroed.
  *
@@ -287,13 +335,16 @@ typedef struct gpu_rt_dispatch_desc {
  * the Ruby method.
  *
  * Raises ArgumentError when the description does not fit the pipeline, or
- * when groups[0] is more than the device allows in one dispatch. */
+ * when groups[0] is more than the device allows in one dispatch, and
+ * GPU::Error or a subclass when the device fails; the message then starts
+ * with the label. */
 void gpu_rt_dispatch(mrb_state *mrb, const gpu_rt_dispatch_desc *desc);
 
 /* ---- Sync ---- */
 
 /* Run everything recorded and wait for it. Returns at once when nothing is
- * recorded. Raises RuntimeError if the device fails. */
+ * recorded. Raises GPU::DeviceError if the device is lost, and GPU::Error or
+ * another subclass for any other failure of the device. */
 void gpu_rt_sync(mrb_state *mrb, gpu_rt_context *ctx);
 
 /* The same, but only if a recorded dispatch touches `buf`. */
