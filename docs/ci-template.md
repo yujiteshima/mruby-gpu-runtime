@@ -20,6 +20,8 @@ Every suite runs on every mruby version and runner. Each job:
 
 The job summary shows the test counts of each job.
 
+One more job, `Validate the SPIR-V`, runs once, not per suite. It runs `spirv-val` on the SPIR-V the repository ships (`SPIRV_FILES`) and fails if a module is rejected.
+
 ## How to copy it
 
 1. Copy `.github/workflows/ci.yml` to the same path in your gem.
@@ -31,6 +33,9 @@ The job summary shows the test counts of each job.
    | `TEST_FILE` | your test script, relative to the repository root | `test/runtime_test.rb` |
    | `FAIL_ON_SKIP` | whether your own suite fails when the test script prints a `SKIP` line | `'true'` |
    | `TEST_GEMS` | test-only gems inside your repository, listed in every suite | `test/capi` |
+   | `SPIRV_FILES` | the SPIR-V your repository ships, for `spirv-val` | `test/capi/src/*_spv.h` |
+   | `SPIRV_TARGET_ENV` | what `spirv-val` validates against | `vulkan1.1` |
+   | `SHADER_BUILD` | a command that creates the files of `SPIRV_FILES`, if they are not committed | `''` |
    | `DOWNSTREAM` | the gems that build on yours, one suite per line | mruby-gpu-narray and mruby-gpu-kernel |
 
 3. Nothing else needs to change. The matrix of mruby versions and runners is in the `test` job, if you need a different one.
@@ -52,6 +57,35 @@ Set it to `'false'` if your script skips tests on purpose on lavapipe, for examp
 Gems that exist only for the tests and live inside your repository: directories relative to the repository root, separated by spaces. Each must have an `mrbgem.rake`. Every suite, the downstream ones too, lists them in the build configuration by path, right after your checkout.
 
 This repository uses `TEST_GEMS: test/capi`. That gem gives `test/runtime_test.rb` a way to call the C API, and building it in every suite shows that it builds next to the downstream gems. A gem with no test-only gems sets `TEST_GEMS: ''`.
+
+### `SPIRV_FILES`, `SPIRV_TARGET_ENV` and `SHADER_BUILD`
+
+A Vulkan driver does not have to check the SPIR-V it is given. It may accept an invalid module and misbehave later, and drivers differ in what they accept. `spirv-val`, from SPIRV-Tools, checks a module against the SPIR-V rules and the rules of one Vulkan version, so the `Validate the SPIR-V` job finds a bad shader on every pull request, on no device at all.
+
+`SPIRV_FILES` lists file patterns relative to the repository root, separated by spaces. The job fails if a pattern matches no file.
+
+- A file whose name ends in `.spv` is validated as it is.
+- Any other file is read as a C header with one embedded module, the way `glslangValidator --vn` writes it. The job takes every `0x........` word of the file, in order, and validates the result. Such a header must hold one module and no other eight-digit hexadecimal constant.
+
+`SPIRV_TARGET_ENV` is passed to `spirv-val --target-env`. mruby-gpu-runtime creates its Vulkan instance for Vulkan 1.1, so the value is `vulkan1.1`.
+
+`SHADER_BUILD` is for a gem that compiles its shaders when it is built and does not commit the SPIR-V. It is a shell command, run from the repository root before `spirv-val`, and `glslangValidator` and `make` are installed for it. For example:
+
+```yaml
+SPIRV_FILES: shader/*.spv
+SHADER_BUILD: make -C shader
+```
+
+This repository commits its SPIR-V, the shaders of `test/capi`, as headers, so it uses `SPIRV_FILES: test/capi/src/*_spv.h` and `SHADER_BUILD: ''`. A gem that ships no SPIR-V sets `SPIRV_FILES: ''`, and the job then does nothing.
+
+The job validates the SPIR-V in the repository. It does not validate SPIR-V that a gem generates when the program runs, as mruby-gpu-kernel does.
+
+To run the same check by hand on an embedded module:
+
+```sh
+ruby -e 'STDOUT.binmode; STDOUT.write(ARGF.read.scan(/0x\h{8}/).map(&:hex).pack("V*"))' test/capi/src/inc_spv.h > /tmp/inc.spv
+spirv-val --target-env vulkan1.1 /tmp/inc.spv
+```
 
 ### `DOWNSTREAM`
 

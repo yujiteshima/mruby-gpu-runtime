@@ -155,10 +155,25 @@ typedef enum gpu_rt_feature {
  * value is false too. */
 mrb_bool gpu_rt_context_has_feature(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_feature feature);
 
+/* What this device allows in one layout (see gpu_rt_layout). The numbers
+ * differ between devices; Vulkan guarantees at least 4 storage buffers,
+ * 12 uniform buffers, 128 bytes of push constants and 16384 bytes in a
+ * uniform buffer. */
+typedef struct gpu_rt_limits {
+  uint32_t max_storage_buffers;      /* in one layout */
+  uint32_t max_uniform_buffers;      /* in one layout */
+  uint32_t max_push_constant_size;   /* bytes */
+  uint32_t max_uniform_buffer_size;  /* bytes of a buffer bound as a uniform buffer */
+} gpu_rt_limits;
+
+/* Fill `*out` with the device's limits. */
+void gpu_rt_context_limits(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_limits *out);
+
 /* ---- Buffers ---- */
 
 /* How a buffer may be used; OR them together. */
 #define GPU_RT_BUFFER_STORAGE (1u << 0)   /* bound to a pipeline as a storage buffer */
+#define GPU_RT_BUFFER_UNIFORM (1u << 1)   /* bound to a pipeline as a uniform buffer */
 
 typedef struct gpu_rt_buffer_desc {
   size_t   size;    /* in bytes; 0 is allowed and makes an empty buffer */
@@ -212,19 +227,30 @@ void  gpu_rt_buffer_unmap(mrb_state *mrb, gpu_rt_buffer *buf);
 
 /* ---- Pipelines ---- */
 
-/* The most bytes of push constants a layout may ask for. */
+/* A layout within these two is accepted on every device. They were the most
+ * a layout could ask for before layouts became general; the most on this
+ * device is what gpu_rt_context_limits() reports. */
 #define GPU_RT_MAX_PUSH_CONSTANT_SIZE 16
-/* The most storage buffers a layout may ask for. */
 #define GPU_RT_MAX_STORAGE_BUFFERS 3
 
-/* What a shader binds, described by value. The shader declares its storage
- * buffers as `layout(set = 0, binding = i)` for i from 0, in the order they
- * are passed to gpu_rt_dispatch(), and at most one push-constant block. */
+/* What a shader binds, described by value. All bindings are in set 0:
+ *
+ *  - the storage buffers at `layout(set = 0, binding = i)` for i from 0, in
+ *    the order they are passed to gpu_rt_dispatch();
+ *  - then the uniform buffers, at the bindings after the last storage buffer
+ *    (binding = storage_buffers + j), in the order of the dispatch's
+ *    uniform_buffers;
+ *  - and at most one push-constant block, of at most push_constant_size bytes.
+ *
+ * The runtime does not read the SPIR-V, so the description must be true: a
+ * shader that binds more, or declares a larger push-constant block, than its
+ * layout says is an error the device may not report.
+ *
+ * A description beyond gpu_rt_context_limits() raises ArgumentError. */
 typedef struct gpu_rt_layout {
-  uint32_t storage_buffers;      /* 1 .. GPU_RT_MAX_STORAGE_BUFFERS */
-  uint32_t push_constant_size;   /* bytes, 0 .. GPU_RT_MAX_PUSH_CONSTANT_SIZE */
-  /* More kinds of binding (a uniform buffer, more storage buffers) join this
-   * struct with runtime#3. */
+  uint32_t storage_buffers;      /* 1 .. max_storage_buffers */
+  uint32_t push_constant_size;   /* bytes, a multiple of 4, 0 .. max_push_constant_size */
+  uint32_t uniform_buffers;      /* 0 .. max_uniform_buffers; usually 0 or 1 */
 } gpu_rt_layout;
 
 /* Why gpu_rt_pipeline_create() failed. */
@@ -247,9 +273,15 @@ typedef struct gpu_rt_error {
  *  - `error_out` is not NULL: returns NULL and fills `*error_out`. On success
  *    `*error_out` is zeroed.
  *
- * A layout this runtime cannot provide raises ArgumentError either way.
+ * A layout this device cannot provide raises ArgumentError either way.
  *
- * The caller owns the pipeline until gpu_rt_pipeline_release(). */
+ * Pipelines are cached: a call with the same SPIR-V bytes and the same
+ * layout as a pipeline that is still alive does not compile again. It
+ * returns a new handle to the same device pipeline, with its own label.
+ * Every handle is released once, and the device pipeline goes with the last
+ * one, so creating the same pipeline in several places is cheap and safe.
+ *
+ * The caller owns the handle until gpu_rt_pipeline_release(). */
 gpu_rt_pipeline *gpu_rt_pipeline_create(mrb_state *mrb, gpu_rt_context *ctx,
                                         const void *spirv, size_t spirv_size,
                                         const gpu_rt_layout *layout, const char *label,
@@ -261,18 +293,25 @@ gpu_rt_pipeline *gpu_rt_pipeline_create(mrb_state *mrb, gpu_rt_context *ctx,
  * ignored. */
 void gpu_rt_pipeline_release(mrb_state *mrb, gpu_rt_pipeline *pipeline);
 
+/* How many pipelines the device holds for the handles that are alive. Handles
+ * that share one cached pipeline count once. For tests and diagnostics. */
+uint32_t gpu_rt_pipeline_count(mrb_state *mrb, gpu_rt_context *ctx);
+
 /* ---- Dispatch ---- */
 
 typedef struct gpu_rt_dispatch_desc {
   gpu_rt_pipeline *pipeline;
-  gpu_rt_buffer  **buffers;            /* in binding order */
+  gpu_rt_buffer  **buffers;            /* the storage buffers, in binding order */
   uint32_t         buffer_count;       /* must be the layout's storage_buffers */
   const void      *push_constants;     /* copied during the call; NULL when the size is 0 */
-  uint32_t         push_constant_size; /* at most the layout's push_constant_size */
+  uint32_t         push_constant_size; /* a multiple of 4, at most the layout's push_constant_size */
   uint32_t         groups[3];          /* workgroups in x, y, z. A 0 in y or z means 1;
                                         * a 0 in x records a dispatch that does nothing. */
   const char      *label;              /* the operation's name, e.g. "add"; copied.
                                         * NULL means the pipeline's label. */
+  gpu_rt_buffer  **uniform_buffers;    /* in binding order, created with GPU_RT_BUFFER_UNIFORM;
+                                        * NULL when the layout has none */
+  uint32_t         uniform_buffer_count; /* must be the layout's uniform_buffers */
 } gpu_rt_dispatch_desc;
 
 /* Record one dispatch into the batch. It runs, together with everything else
@@ -285,6 +324,10 @@ typedef struct gpu_rt_dispatch_desc {
  * also wants the Ruby line that asked for the dispatch; the runtime reads it
  * from `mrb` at this call, so call this from the C function that implements
  * the Ruby method.
+ *
+ * A uniform buffer is read when the batch runs, like any other buffer: what
+ * it holds then is what the shader sees, and mapping it waits for the
+ * dispatches that use it.
  *
  * Raises ArgumentError when the description does not fit the pipeline, or
  * when groups[0] is more than the device allows in one dispatch. */

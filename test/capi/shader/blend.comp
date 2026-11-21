@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufB { float b[]; };
+layout(set = 0, binding = 2) buffer BufC { float c[]; };
+layout(set = 0, binding = 3) buffer BufO { float o[]; };
+
+// The uniform buffer takes the binding after the last storage buffer.
+layout(set = 0, binding = 4) uniform Weights {
+    vec4 w;
+} u;
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+    float scale;
+    vec4 offset;    // at byte 16, so the block is 32 bytes
+} pc;
+
+// o = (a * w.x + b * w.y + c * w.z + w.w) * scale + offset[idx % 4]: four
+// storage buffers, one uniform buffer and 32 bytes of push constants, which
+// is more of each than the three fixed layouts had.
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < pc.n) {
+        o[idx] = (a[idx] * u.w.x + b[idx] * u.w.y + c[idx] * u.w.z + u.w.w) * pc.scale
+                 + pc.offset[idx & 3u];
+    }
+}
