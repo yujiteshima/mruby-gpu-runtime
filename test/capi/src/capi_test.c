@@ -11,9 +11,11 @@
 
 #include "axpy_spv.h"   /* c = a * s + b: 3 buffers, push { uint n; float s; } */
 #include "inc_spv.h"    /* a += 1:        1 buffer,  push { uint n; }          */
+#include "widen_spv.h"  /* b = int(a) - 128: uint8 in, int32 out, push { uint n; } */
 
 static gpu_rt_pipeline *axpy_pipe;
 static gpu_rt_pipeline *inc_pipe;
+static gpu_rt_pipeline *widen_pipe;
 
 static struct RClass *buffer_class(mrb_state *mrb) {
   return mrb_class_get_under(mrb, mrb_module_get(mrb, "GPURuntimeTest"), "Buffer");
@@ -198,6 +200,166 @@ static mrb_value t_bytesize_of(mrb_state *mrb, mrb_value self) {
   return mrb_fixnum_value((mrb_int)gpu_rt_buffer_size(mrb, gpu_rt_buffer_get(mrb, obj)));
 }
 
+/* ---- dtype and shape ---- */
+
+static mrb_value shape_of(mrb_state *mrb, gpu_rt_buffer *buf) {
+  uint32_t ndim = gpu_rt_buffer_ndim(mrb, buf);
+  uint32_t shape[GPU_RT_MAX_DIMS];
+  memset(shape, 0xff, sizeof(shape));
+  gpu_rt_buffer_shape(mrb, buf, shape);
+  mrb_value v = mrb_ary_new(mrb);
+  for (uint32_t i = 0; i < GPU_RT_MAX_DIMS; i++) {
+    if (i < ndim) mrb_ary_push(mrb, v, mrb_fixnum_value((mrb_int)shape[i]));
+    else if (shape[i] != 0) mrb_raise(mrb, E_RUNTIME_ERROR, "an extent past ndim is not 0");
+  }
+  return v;
+}
+
+/* Buffer.typed(dtype, shape, bytes = 0, ndim = shape.size) -> Buffer
+ * `shape` nil leaves ndim at 0, so the one extent comes from `bytes`. `ndim`
+ * is what the description claims, for the check of too many dimensions. */
+static mrb_value buf_s_typed(mrb_state *mrb, mrb_value self) {
+  mrb_int dtype, size = 0, ndim = -1;
+  mrb_value shape;
+  mrb_get_args(mrb, "io|ii", &dtype, &shape, &size, &ndim);
+  gpu_rt_buffer_desc desc = {
+    .size = (size_t)size, .usage = GPU_RT_BUFFER_STORAGE, .dtype = (gpu_rt_dtype)dtype,
+  };
+  if (!mrb_nil_p(shape)) {
+    mrb_check_type(mrb, shape, MRB_TT_ARRAY);
+    desc.ndim = (uint32_t)RARRAY_LEN(shape);
+    for (mrb_int i = 0; i < RARRAY_LEN(shape) && i < GPU_RT_MAX_DIMS; i++) {
+      desc.shape[i] = (uint32_t)mrb_integer(mrb_ary_ref(mrb, shape, i));
+    }
+  }
+  if (ndim >= 0) desc.ndim = (uint32_t)ndim;
+  gpu_rt_buffer *buf = gpu_rt_buffer_create(mrb, gpu_rt_context_get(mrb), &desc);
+  return gpu_rt_buffer_wrap(mrb, mrb_class_ptr(self), buf);
+}
+
+static mrb_value buf_dtype(mrb_state *mrb, mrb_value self) {
+  return mrb_fixnum_value((mrb_int)gpu_rt_buffer_dtype(mrb, gpu_rt_buffer_get(mrb, self)));
+}
+
+static mrb_value buf_ndim(mrb_state *mrb, mrb_value self) {
+  return mrb_fixnum_value((mrb_int)gpu_rt_buffer_ndim(mrb, gpu_rt_buffer_get(mrb, self)));
+}
+
+static mrb_value buf_shape(mrb_state *mrb, mrb_value self) {
+  return shape_of(mrb, gpu_rt_buffer_get(mrb, self));
+}
+
+static mrb_value buf_count(mrb_state *mrb, mrb_value self) {
+  return mrb_fixnum_value((mrb_int)gpu_rt_buffer_count(mrb, gpu_rt_buffer_get(mrb, self)));
+}
+
+/* buf.write_bytes(string) -> buf; the string must be the buffer's size */
+static mrb_value buf_write_bytes(mrb_state *mrb, mrb_value self) {
+  mrb_value str;
+  mrb_get_args(mrb, "S", &str);
+  gpu_rt_buffer *buf = gpu_rt_buffer_get(mrb, self);
+  size_t size = gpu_rt_buffer_size(mrb, buf);
+  if ((size_t)RSTRING_LEN(str) != size) mrb_raise(mrb, E_ARGUMENT_ERROR, "wrong number of bytes");
+  void *m = gpu_rt_buffer_map(mrb, buf);
+  if (size) memcpy(m, RSTRING_PTR(str), size);
+  gpu_rt_buffer_unmap(mrb, buf);
+  return self;
+}
+
+/* buf.read_values -> [Integer or Float], one per element, read as the dtype says */
+static mrb_value buf_read_values(mrb_state *mrb, mrb_value self) {
+  gpu_rt_buffer *buf = gpu_rt_buffer_get(mrb, self);
+  gpu_rt_dtype dtype = gpu_rt_buffer_dtype(mrb, buf);
+  size_t count = gpu_rt_buffer_count(mrb, buf);
+  size_t size = gpu_rt_buffer_size(mrb, buf);
+  unsigned char *tmp = (unsigned char *)mrb_malloc(mrb, size ? size : 1);
+  void *m = gpu_rt_buffer_map(mrb, buf);
+  if (size) memcpy(tmp, m, size);
+  gpu_rt_buffer_unmap(mrb, buf);
+  mrb_value ary = mrb_ary_new_capa(mrb, (mrb_int)count);
+  int ai = mrb_gc_arena_save(mrb);
+  for (size_t i = 0; i < count; i++) {
+    mrb_value v;
+    switch (dtype) {
+      case GPU_RT_DTYPE_UINT8:  v = mrb_fixnum_value(tmp[i]); break;
+      case GPU_RT_DTYPE_UINT16: { uint16_t x; memcpy(&x, tmp + i * 2, 2); v = mrb_fixnum_value(x); break; }
+      case GPU_RT_DTYPE_INT32:  { int32_t x;  memcpy(&x, tmp + i * 4, 4); v = mrb_fixnum_value(x); break; }
+      default:                  { float x;    memcpy(&x, tmp + i * 4, 4); v = mrb_float_value(mrb, x); break; }
+    }
+    mrb_ary_push(mrb, ary, v);
+    mrb_gc_arena_restore(mrb, ai);
+  }
+  mrb_free(mrb, tmp);
+  return ary;
+}
+
+/* GPURuntimeTest.describe(obj) -> [dtype name, shape, count, bytes], read
+ * through gpu_rt_buffer_get the way a gem reads an argument from Ruby */
+static mrb_value t_describe(mrb_state *mrb, mrb_value self) {
+  mrb_value obj;
+  mrb_get_args(mrb, "o", &obj);
+  gpu_rt_buffer *buf = gpu_rt_buffer_get(mrb, obj);
+  mrb_value v = mrb_ary_new(mrb);
+  mrb_ary_push(mrb, v, mrb_str_new_cstr(mrb, gpu_rt_dtype_name(mrb, gpu_rt_buffer_dtype(mrb, buf))));
+  mrb_ary_push(mrb, v, shape_of(mrb, buf));
+  mrb_ary_push(mrb, v, mrb_fixnum_value((mrb_int)gpu_rt_buffer_count(mrb, buf)));
+  mrb_ary_push(mrb, v, mrb_fixnum_value((mrb_int)gpu_rt_buffer_size(mrb, buf)));
+  return v;
+}
+
+/* GPURuntimeTest.dtypes -> [[name, element size], ...] for every value from
+ * 0 to GPU_RT_DTYPE_COUNT, so the last entry is of a value that is no dtype */
+static mrb_value t_dtypes(mrb_state *mrb, mrb_value self) {
+  mrb_value v = mrb_ary_new(mrb);
+  for (int d = 0; d <= GPU_RT_DTYPE_COUNT; d++) {
+    mrb_value e = mrb_ary_new(mrb);
+    mrb_ary_push(mrb, e, mrb_str_new_cstr(mrb, gpu_rt_dtype_name(mrb, (gpu_rt_dtype)d)));
+    mrb_ary_push(mrb, e, mrb_fixnum_value((mrb_int)gpu_rt_dtype_size(mrb, (gpu_rt_dtype)d)));
+    mrb_ary_push(mrb, v, e);
+  }
+  return v;
+}
+
+static mrb_value t_max_dims(mrb_state *mrb, mrb_value self) {
+  return mrb_fixnum_value(GPU_RT_MAX_DIMS);
+}
+
+/* GPURuntimeTest.widen(a) -> b = int(a) - 128. `a` is uint8 of any shape, and
+ * `b` is int32 of the same shape. */
+static mrb_value t_widen(mrb_state *mrb, mrb_value self) {
+  mrb_value a_obj;
+  mrb_get_args(mrb, "o", &a_obj);
+  gpu_rt_context *ctx = gpu_rt_context_get(mrb);
+  gpu_rt_buffer *a = gpu_rt_buffer_get(mrb, a_obj);
+  if (gpu_rt_buffer_dtype(mrb, a) != GPU_RT_DTYPE_UINT8) {
+    mrb_raisef(mrb, E_TYPE_ERROR, "widen takes uint8, got %s",
+               gpu_rt_dtype_name(mrb, gpu_rt_buffer_dtype(mrb, a)));
+  }
+  if (!widen_pipe) {
+    gpu_rt_layout layout = { .storage_buffers = 2, .push_constant_size = sizeof(uint32_t) };
+    widen_pipe = gpu_rt_pipeline_create(mrb, ctx, widen_spv, sizeof(widen_spv), &layout, "widen", NULL);
+  }
+
+  gpu_rt_buffer_desc desc = {
+    .usage = GPU_RT_BUFFER_STORAGE, .dtype = GPU_RT_DTYPE_INT32,
+    .ndim = gpu_rt_buffer_ndim(mrb, a),
+  };
+  gpu_rt_buffer_shape(mrb, a, desc.shape);
+  gpu_rt_buffer *b = gpu_rt_buffer_create(mrb, ctx, &desc);
+  mrb_value result = gpu_rt_buffer_wrap(mrb, buffer_class(mrb), b);
+
+  uint32_t n = (uint32_t)gpu_rt_buffer_count(mrb, a);
+  gpu_rt_buffer *bufs[2] = { a, b };
+  gpu_rt_dispatch_desc d = {
+    .pipeline = widen_pipe,
+    .buffers = bufs, .buffer_count = 2,
+    .push_constants = &n, .push_constant_size = sizeof(n),
+    .groups = { (n + 255) / 256 },
+  };
+  gpu_rt_dispatch(mrb, &d);
+  return result;
+}
+
 /* ---- pipelines and dispatch ---- */
 
 /* GPURuntimeTest.axpy(a, b, s, label = nil, count = 3, push = 8) -> c = a * s + b
@@ -321,6 +483,10 @@ void mrb_mruby_gpu_runtime_capi_test_gem_init(mrb_state *mrb) {
   mrb_define_module_function(mrb, t, "inc_and_release", t_inc_and_release, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, t, "inc_groups", t_inc_groups, MRB_ARGS_REQ(2));
   mrb_define_module_function(mrb, t, "create_pipeline", t_create_pipeline, MRB_ARGS_REQ(4));
+  mrb_define_module_function(mrb, t, "describe", t_describe, MRB_ARGS_REQ(1));
+  mrb_define_module_function(mrb, t, "dtypes", t_dtypes, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, t, "max_dims", t_max_dims, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, t, "widen", t_widen, MRB_ARGS_REQ(1));
 
   struct RClass *buf = mrb_define_class_under(mrb, t, "Buffer", mrb->object_class);
   MRB_SET_INSTANCE_TT(buf, MRB_TT_CDATA);
@@ -332,11 +498,19 @@ void mrb_mruby_gpu_runtime_capi_test_gem_init(mrb_state *mrb) {
   mrb_define_method(mrb, buf, "write", buf_write, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, buf, "read", buf_read, MRB_ARGS_NONE());
   mrb_define_method(mrb, buf, "sync", buf_sync, MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, buf, "typed", buf_s_typed, MRB_ARGS_ARG(2, 2));
+  mrb_define_method(mrb, buf, "dtype", buf_dtype, MRB_ARGS_NONE());
+  mrb_define_method(mrb, buf, "ndim", buf_ndim, MRB_ARGS_NONE());
+  mrb_define_method(mrb, buf, "shape", buf_shape, MRB_ARGS_NONE());
+  mrb_define_method(mrb, buf, "count", buf_count, MRB_ARGS_NONE());
+  mrb_define_method(mrb, buf, "write_bytes", buf_write_bytes, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, buf, "read_values", buf_read_values, MRB_ARGS_NONE());
 }
 
 /* Runs before the runtime's final, which tears the device down. */
 void mrb_mruby_gpu_runtime_capi_test_gem_final(mrb_state *mrb) {
   gpu_rt_pipeline_release(mrb, axpy_pipe);
   gpu_rt_pipeline_release(mrb, inc_pipe);
-  axpy_pipe = inc_pipe = NULL;
+  gpu_rt_pipeline_release(mrb, widen_pipe);
+  axpy_pipe = inc_pipe = widen_pipe = NULL;
 }
