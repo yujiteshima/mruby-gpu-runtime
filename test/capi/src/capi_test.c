@@ -5,15 +5,22 @@
 #include <gpu_runtime.h>
 #include <mruby/array.h>
 #include <mruby/class.h>
+#include <mruby/data.h>
 #include <mruby/hash.h>
 #include <mruby/string.h>
 #include <string.h>
 
 #include "axpy_spv.h"   /* c = a * s + b: 3 buffers, push { uint n; float s; } */
 #include "inc_spv.h"    /* a += 1:        1 buffer,  push { uint n; }          */
+#include "blend_spv.h"  /* o = (a*w.x + b*w.y + c*w.z + w.w) * scale + offset[i % 4]:
+                         * 4 buffers, 1 uniform buffer { vec4 w; },
+                         * push { uint n; float scale; vec4 offset; } (32 bytes) */
+#include "ones_spv.h"   /* a = 1:         1 buffer,  no push constants         */
 
 static gpu_rt_pipeline *axpy_pipe;
 static gpu_rt_pipeline *inc_pipe;
+static gpu_rt_pipeline *blend_pipe;
+static gpu_rt_pipeline *ones_pipe;
 
 static struct RClass *buffer_class(mrb_state *mrb) {
   return mrb_class_get_under(mrb, mrb_module_get(mrb, "GPURuntimeTest"), "Buffer");
@@ -275,15 +282,17 @@ static mrb_value t_inc_groups(mrb_state *mrb, mrb_value self) {
   return a_obj;
 }
 
-/* GPURuntimeTest.create_pipeline(storage_buffers, push_size, spirv_bytes, report)
+/* GPURuntimeTest.create_pipeline(storage_buffers, push_size, spirv_bytes, report,
+ *                                uniform_buffers = 0)
  *   -> true, or [operation, reason, vk_result] when `report` and it failed.
  * `spirv_bytes` cuts the inc shader short; 0 means all of it. */
 static mrb_value t_create_pipeline(mrb_state *mrb, mrb_value self) {
-  mrb_int bufs, push, bytes;
+  mrb_int bufs, push, bytes, uniforms = 0;
   mrb_bool report;
-  mrb_get_args(mrb, "iiib", &bufs, &push, &bytes, &report);
+  mrb_get_args(mrb, "iiib|i", &bufs, &push, &bytes, &report, &uniforms);
   gpu_rt_context *ctx = gpu_rt_context_get(mrb);
-  gpu_rt_layout layout = { .storage_buffers = (uint32_t)bufs, .push_constant_size = (uint32_t)push };
+  gpu_rt_layout layout = { .storage_buffers = (uint32_t)bufs, .push_constant_size = (uint32_t)push,
+                           .uniform_buffers = (uint32_t)uniforms };
   gpu_rt_error err = { "untouched", "untouched", 12345 };
   gpu_rt_pipeline *p = gpu_rt_pipeline_create(mrb, ctx, inc_spv,
                                               bytes ? (size_t)bytes : sizeof(inc_spv),
@@ -300,6 +309,149 @@ static mrb_value t_create_pipeline(mrb_state *mrb, mrb_value self) {
   mrb_ary_push(mrb, v, mrb_str_new_cstr(mrb, err.reason));
   mrb_ary_push(mrb, v, mrb_fixnum_value(err.vk_result));
   return v;
+}
+
+/* ---- layouts beyond the three fixed ones, and the pipeline cache ---- */
+
+static mrb_value t_limits(mrb_state *mrb, mrb_value self) {
+  gpu_rt_limits lim;
+  gpu_rt_context_limits(mrb, gpu_rt_context_get(mrb), &lim);
+  mrb_value h = mrb_hash_new(mrb);
+  mrb_hash_set(mrb, h, mrb_symbol_value(mrb_intern_lit(mrb, "max_storage_buffers")),
+               mrb_fixnum_value((mrb_int)lim.max_storage_buffers));
+  mrb_hash_set(mrb, h, mrb_symbol_value(mrb_intern_lit(mrb, "max_uniform_buffers")),
+               mrb_fixnum_value((mrb_int)lim.max_uniform_buffers));
+  mrb_hash_set(mrb, h, mrb_symbol_value(mrb_intern_lit(mrb, "max_push_constant_size")),
+               mrb_fixnum_value((mrb_int)lim.max_push_constant_size));
+  mrb_hash_set(mrb, h, mrb_symbol_value(mrb_intern_lit(mrb, "max_uniform_buffer_size")),
+               mrb_fixnum_value((mrb_int)lim.max_uniform_buffer_size));
+  return h;
+}
+
+static mrb_value t_pipeline_count(mrb_state *mrb, mrb_value self) {
+  return mrb_fixnum_value((mrb_int)gpu_rt_pipeline_count(mrb, gpu_rt_context_get(mrb)));
+}
+
+/* GPURuntimeTest.blend(a, b, c, weights, scale, offsets, uniform_count = 1)
+ *   -> o = (a*w.x + b*w.y + c*w.z + w.w) * scale + offsets[i % 4]
+ * `weights` is a buffer of 4 floats, bound as the uniform buffer; `offsets` is
+ * an Array of 4 numbers. `uniform_count` is what the dispatch claims. */
+static mrb_value t_blend(mrb_state *mrb, mrb_value self) {
+  mrb_value a_obj, b_obj, c_obj, w_obj, offsets;
+  mrb_float scale;
+  mrb_int uniform_count = 1;
+  mrb_get_args(mrb, "oooofA|i", &a_obj, &b_obj, &c_obj, &w_obj, &scale, &offsets, &uniform_count);
+  gpu_rt_context *ctx = gpu_rt_context_get(mrb);
+  gpu_rt_buffer *a = gpu_rt_buffer_get(mrb, a_obj);
+  gpu_rt_buffer *b = gpu_rt_buffer_get(mrb, b_obj);
+  gpu_rt_buffer *c = gpu_rt_buffer_get(mrb, c_obj);
+  gpu_rt_buffer *w = mrb_nil_p(w_obj) ? NULL : gpu_rt_buffer_get(mrb, w_obj);
+  if (RARRAY_LEN(offsets) != 4) mrb_raise(mrb, E_ARGUMENT_ERROR, "offsets takes 4 numbers");
+
+  uint32_t n = float_count(mrb, a);
+  struct { uint32_t n; float scale; uint32_t pad[2]; float offset[4]; } push = { n, (float)scale, {0, 0}, {0} };
+  for (int i = 0; i < 4; i++) {
+    mrb_value v = mrb_ary_ref(mrb, offsets, i);
+    push.offset[i] = mrb_float_p(v) ? (float)mrb_float(v) : (float)mrb_integer(v);
+  }
+
+  if (!blend_pipe) {
+    gpu_rt_layout layout = { .storage_buffers = 4, .push_constant_size = sizeof(push),
+                             .uniform_buffers = 1 };
+    blend_pipe = gpu_rt_pipeline_create(mrb, ctx, blend_spv, sizeof(blend_spv), &layout, "blend", NULL);
+  }
+
+  gpu_rt_buffer *o;
+  mrb_value result = new_floats(mrb, ctx, n, &o);
+  gpu_rt_buffer *bufs[4] = { a, b, c, o };
+  gpu_rt_dispatch_desc d = {
+    .pipeline = blend_pipe,
+    .buffers = bufs, .buffer_count = 4,
+    .push_constants = &push, .push_constant_size = sizeof(push),
+    .groups = { (n + 255) / 256 },
+    .uniform_buffers = &w, .uniform_buffer_count = (uint32_t)uniform_count,
+  };
+  gpu_rt_dispatch(mrb, &d);
+  return result;
+}
+
+/* GPURuntimeTest.ones(a) -> a, every element set to 1. A layout with no push
+ * constants. */
+static mrb_value t_ones(mrb_state *mrb, mrb_value self) {
+  mrb_value a_obj;
+  mrb_get_args(mrb, "o", &a_obj);
+  gpu_rt_context *ctx = gpu_rt_context_get(mrb);
+  gpu_rt_buffer *a = gpu_rt_buffer_get(mrb, a_obj);
+  if (!ones_pipe) {
+    gpu_rt_layout layout = { .storage_buffers = 1 };
+    ones_pipe = gpu_rt_pipeline_create(mrb, ctx, ones_spv, sizeof(ones_spv), &layout, "ones", NULL);
+  }
+  gpu_rt_dispatch_desc d = {
+    .pipeline = ones_pipe,
+    .buffers = &a, .buffer_count = 1,
+    .groups = { (float_count(mrb, a) + 255) / 256 },
+  };
+  gpu_rt_dispatch(mrb, &d);
+  return a_obj;
+}
+
+/* GPURuntimeTest::Pipeline: a handle from gpu_rt_pipeline_create that Ruby
+ * holds, for the cache tests. One still held when mruby closes is released
+ * by the GC after the runtime's final, which is the order a gem's GC free
+ * function sees too. */
+typedef struct { gpu_rt_pipeline *pipe; } test_pipeline;
+
+static void test_pipeline_free(mrb_state *mrb, void *ptr) {
+  test_pipeline *tp = (test_pipeline *)ptr;
+  if (!tp) return;
+  gpu_rt_pipeline_release(mrb, tp->pipe);   /* NULL is ignored */
+  mrb_free(mrb, tp);
+}
+
+static const struct mrb_data_type test_pipeline_type = { "GPURuntimeTest::Pipeline", test_pipeline_free };
+
+/* Pipeline.inc(storage_buffers = 1, push_size = 4, label = nil) -> Pipeline
+ * The inc shader with the given layout. A layout that describes more than
+ * the shader uses is valid, so this makes distinct pipelines from one shader. */
+static mrb_value pipe_s_inc(mrb_state *mrb, mrb_value self) {
+  mrb_int bufs = 1, push = 4;
+  const char *label = NULL;
+  mrb_get_args(mrb, "|iiz!", &bufs, &push, &label);
+  gpu_rt_context *ctx = gpu_rt_context_get(mrb);
+  test_pipeline *tp = (test_pipeline *)mrb_malloc(mrb, sizeof(*tp));
+  tp->pipe = NULL;
+  mrb_value obj = mrb_obj_value(mrb_data_object_alloc(mrb, mrb_class_ptr(self), tp, &test_pipeline_type));
+  gpu_rt_layout layout = { .storage_buffers = (uint32_t)bufs, .push_constant_size = (uint32_t)push };
+  tp->pipe = gpu_rt_pipeline_create(mrb, ctx, inc_spv, sizeof(inc_spv), &layout, label, NULL);
+  return obj;
+}
+
+/* pipe.inc(a, push_size = 4) -> a, incremented in place through this handle.
+ * The layout must have one storage buffer. `push_size` is what the dispatch
+ * claims. */
+static mrb_value pipe_inc(mrb_state *mrb, mrb_value self) {
+  mrb_value a_obj;
+  mrb_int push_size = 4;
+  mrb_get_args(mrb, "o|i", &a_obj, &push_size);
+  test_pipeline *tp = (test_pipeline *)mrb_data_get_ptr(mrb, self, &test_pipeline_type);
+  if (!tp->pipe) mrb_raise(mrb, E_RUNTIME_ERROR, "this test pipeline was released");
+  gpu_rt_buffer *a = gpu_rt_buffer_get(mrb, a_obj);
+  uint32_t push[2] = { float_count(mrb, a), 0 };
+  gpu_rt_dispatch_desc d = {
+    .pipeline = tp->pipe,
+    .buffers = &a, .buffer_count = 1,
+    .push_constants = push, .push_constant_size = (uint32_t)push_size,
+    .groups = { (push[0] + 255) / 256 },
+  };
+  gpu_rt_dispatch(mrb, &d);
+  return a_obj;
+}
+
+static mrb_value pipe_release(mrb_state *mrb, mrb_value self) {
+  test_pipeline *tp = (test_pipeline *)mrb_data_get_ptr(mrb, self, &test_pipeline_type);
+  gpu_rt_pipeline_release(mrb, tp->pipe);
+  tp->pipe = NULL;
+  return mrb_nil_value();
 }
 
 void mrb_mruby_gpu_runtime_capi_test_gem_init(mrb_state *mrb) {
@@ -320,7 +472,11 @@ void mrb_mruby_gpu_runtime_capi_test_gem_init(mrb_state *mrb) {
   mrb_define_module_function(mrb, t, "inc", t_inc, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, t, "inc_and_release", t_inc_and_release, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, t, "inc_groups", t_inc_groups, MRB_ARGS_REQ(2));
-  mrb_define_module_function(mrb, t, "create_pipeline", t_create_pipeline, MRB_ARGS_REQ(4));
+  mrb_define_module_function(mrb, t, "create_pipeline", t_create_pipeline, MRB_ARGS_ARG(4, 1));
+  mrb_define_module_function(mrb, t, "limits", t_limits, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, t, "pipeline_count", t_pipeline_count, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, t, "blend", t_blend, MRB_ARGS_ARG(6, 1));
+  mrb_define_module_function(mrb, t, "ones", t_ones, MRB_ARGS_REQ(1));
 
   struct RClass *buf = mrb_define_class_under(mrb, t, "Buffer", mrb->object_class);
   MRB_SET_INSTANCE_TT(buf, MRB_TT_CDATA);
@@ -332,11 +488,20 @@ void mrb_mruby_gpu_runtime_capi_test_gem_init(mrb_state *mrb) {
   mrb_define_method(mrb, buf, "write", buf_write, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, buf, "read", buf_read, MRB_ARGS_NONE());
   mrb_define_method(mrb, buf, "sync", buf_sync, MRB_ARGS_NONE());
+
+  struct RClass *pipe = mrb_define_class_under(mrb, t, "Pipeline", mrb->object_class);
+  MRB_SET_INSTANCE_TT(pipe, MRB_TT_CDATA);
+  mrb_undef_class_method(mrb, pipe, "new");
+  mrb_define_class_method(mrb, pipe, "inc", pipe_s_inc, MRB_ARGS_OPT(3));
+  mrb_define_method(mrb, pipe, "inc", pipe_inc, MRB_ARGS_ARG(1, 1));
+  mrb_define_method(mrb, pipe, "release", pipe_release, MRB_ARGS_NONE());
 }
 
 /* Runs before the runtime's final, which tears the device down. */
 void mrb_mruby_gpu_runtime_capi_test_gem_final(mrb_state *mrb) {
   gpu_rt_pipeline_release(mrb, axpy_pipe);
   gpu_rt_pipeline_release(mrb, inc_pipe);
-  axpy_pipe = inc_pipe = NULL;
+  gpu_rt_pipeline_release(mrb, blend_pipe);
+  gpu_rt_pipeline_release(mrb, ones_pipe);
+  axpy_pipe = inc_pipe = blend_pipe = ones_pipe = NULL;
 }

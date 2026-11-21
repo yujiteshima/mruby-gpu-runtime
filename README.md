@@ -9,7 +9,8 @@
 The Vulkan core of mruby-gpu-narray now lives here: device and queue setup, buffers and their memory, the descriptor layouts, pipeline creation, and the deferred batch that records dispatches and submits them once. So do the `GPU` module functions about the device and the batch: `GPU.info`, `GPU.device_name`, `GPU.sync`, `GPU.pending` and `GPU.sync_mode`.
 
 - The C API is `include/gpu_runtime.h`: opaque handles for the context, buffers and pipelines, and functions that start with `gpu_rt_`. It is at API version 0.1 and may still change; see [Writing a gem on the C API](#writing-a-gem-on-the-c-api).
-- A pipeline's layout is described by value, and today it can be one, two or three storage buffers plus up to 16 bytes of push constants.
+- A pipeline's layout is described by value: the number of storage buffers, the number of uniform buffers and the size of the push constants, up to what the device allows (`gpu_rt_context_limits`).
+- Pipelines are cached. The same SPIR-V with the same layout is compiled once, however many times it is asked for.
 - Each buffer has a `VkDeviceMemory` of its own; there is no memory pool yet.
 
 ## What it will provide
@@ -44,15 +45,16 @@ A GPU gem includes one header, `<gpu_runtime.h>`, and never calls Vulkan itself.
 | | |
 |---|---|
 | Version | `GPU_RT_API_VERSION`, `gpu_rt_require(mrb, major, minor)` |
-| Context (`gpu_rt_context`) | `gpu_rt_context_get`, `gpu_rt_context_ready`, `gpu_rt_context_info`, `gpu_rt_context_has_feature` |
+| Context (`gpu_rt_context`) | `gpu_rt_context_get`, `gpu_rt_context_ready`, `gpu_rt_context_info`, `gpu_rt_context_has_feature`, `gpu_rt_context_limits` |
 | Buffers (`gpu_rt_buffer`) | `gpu_rt_buffer_create`, `gpu_rt_buffer_wrap`, `gpu_rt_buffer_release`, `gpu_rt_buffer_get`, `gpu_rt_buffer_check`, `gpu_rt_buffer_size`, `gpu_rt_buffer_map`, `gpu_rt_buffer_unmap` |
-| Pipelines (`gpu_rt_pipeline`) | `gpu_rt_pipeline_create`, `gpu_rt_pipeline_release` |
+| Pipelines (`gpu_rt_pipeline`) | `gpu_rt_pipeline_create`, `gpu_rt_pipeline_release`, `gpu_rt_pipeline_count` |
 | Dispatch | `gpu_rt_dispatch` |
 | Sync | `gpu_rt_sync`, `gpu_rt_buffer_sync`, `gpu_rt_pending` |
 
 - `gpu_rt_context_get(mrb)` starts Vulkan the first time it is called, so a program that never uses the GPU never pays for it.
 - A buffer is created with a size in bytes and a usage, and wrapped as a Ruby object at once, so that the GC frees it. `gpu_rt_buffer_get` reads the buffer of a `GPU::NArray` that Ruby passes in.
-- A pipeline is created from SPIR-V bytes and a layout described by value.
+- A pipeline is created from SPIR-V bytes and a layout described by value: `{ .storage_buffers = 2, .push_constant_size = 4 }`, or with `.uniform_buffers = 1` for a shader that also reads a uniform buffer. The storage buffers take bindings 0, 1, ... of set 0 and the uniform buffers the bindings after them. The runtime does not read the SPIR-V, so the description has to match the shader.
+- Creating a pipeline that already exists, with the same SPIR-V and the same layout, returns another handle to it and compiles nothing. Each handle is released once.
 - `gpu_rt_dispatch` records a dispatch, with a label that names the operation, into the batch that all GPU gems share. Nothing runs until a result is needed: `gpu_rt_buffer_map` waits for the dispatches that touch that buffer, and `gpu_rt_sync` for all of them.
 - Every function takes `mrb` first and raises a Ruby exception when it fails.
 - `gpu_rt_require(mrb, 0, 1)` in the gem's init function stops the gem with a message that names both versions when the runtime provides another API version.
@@ -86,7 +88,7 @@ cd /path/to/mruby && MRUBY_CONFIG=build_config.rb rake
 ./build/host/bin/mruby /path/to/mruby-gpu-runtime/test/runtime_test.rb   # ALL TESTS PASSED
 ```
 
-`test/capi` gives the test script a way to call the C API. Without it, the script tests the `GPU` module only, and says that it skipped the rest. Its shaders are committed as SPIR-V (`test/capi/src/*_spv.h`); after editing one, run `make -C test/capi/shader`, which needs `glslangValidator`.
+`test/capi` gives the test script a way to call the C API. Without it, the script tests the `GPU` module only, and says that it skipped the rest. Its shaders are committed as SPIR-V (`test/capi/src/*_spv.h`); after editing one, run `make -C test/capi/shader`, which needs `glslangValidator`. The CI runs `spirv-val` on these headers; see [docs/ci-template.md](docs/ci-template.md).
 
 mruby-gpu-narray's tests run on top of this gem as well.
 

@@ -11,21 +11,22 @@
 #include <mruby/data.h>
 #include <vulkan/vulkan.h>
 
-/* ---- Descriptor-set layouts ----
+/* ---- Layouts ----
  *
- * Every pipeline binds one, two or three storage buffers, plus up to
- * GPU_PUSH_CONSTANT_SIZE bytes of push constants:
- *
- *   LAYOUT_3BUF takes (a, b, c): element-wise binary ops.
- *   LAYOUT_2BUF takes (a, b):    scalar ops, reductions, out-of-place passes.
- *   LAYOUT_1BUF takes (a):       in-place passes.
- */
-typedef enum { LAYOUT_3BUF = 0, LAYOUT_2BUF, LAYOUT_1BUF, LAYOUT_COUNT } LayoutId;
-
-/* Every push block so far is 8 bytes ({ uint n; float scalar; },
- * { uint n; uint h; }, ...); 16 leaves headroom for the next one. The public
- * header promises the same number as GPU_RT_MAX_PUSH_CONSTANT_SIZE. */
-#define GPU_PUSH_CONSTANT_SIZE GPU_RT_MAX_PUSH_CONSTANT_SIZE
+ * What a pipeline binds, as the public gpu_rt_layout describes it: storage
+ * buffers at bindings 0.., then uniform buffers, all in set 0, and one
+ * push-constant range. The descriptor-set layout and the pipeline layout of
+ * each distinct description are created the first time a pipeline asks for
+ * it and kept until shutdown: there are few of them, and pipelines and
+ * recorded dispatches point at them. */
+typedef struct GpuLayout {
+  uint32_t storage_buffers;
+  uint32_t uniform_buffers;
+  uint32_t push_constant_size;
+  VkDescriptorSetLayout desc_layout;
+  VkPipelineLayout pipe_layout;
+  struct GpuLayout *next;
+} GpuLayout;
 
 /* ---- GPU Buffer ----
  *
@@ -47,6 +48,37 @@ extern const struct mrb_data_type gpu_buffer_type;
  * which is just an earlier sync point, not an error. */
 #define GPU_MAX_DESC_SETS 256
 
+/* How many descriptors of each type the pool holds follows from the layouts
+ * created so far (see pool_want in gpu_vulkan.c): a full batch of the widest
+ * layout while that stays under GPU_POOL_DESCRIPTORS, and for wider layouts
+ * that many, or GPU_POOL_MIN_SETS sets if that is more. */
+#define GPU_POOL_DESCRIPTORS 16384
+#define GPU_POOL_MIN_SETS 8
+
+/* Bytes of push constants one batch may carry. A batch that needs more is
+ * flushed early, like one that needs more descriptor sets.
+ *
+ * This is a limit of Mesa V3DV (seen in 25.2.8, and unchanged on Mesa main in
+ * November 2026), kept on every device so that a batch behaves the same
+ * everywhere. When a shader reads its push constants with an index that is
+ * not constant, V3DV copies every dispatch's block into one 4096-byte buffer
+ * per command buffer (check_push_constants_ubo in v3dv_uniforms.c). Its check
+ * for a full buffer is off by one block, and the buffer it then adds is
+ * written at the old offset, so the block that crosses 4096 bytes and every
+ * one after it lands outside the buffer: first a dispatch that silently does
+ * nothing, then a crash.
+ *
+ * The runtime counts the way V3DV places the blocks. Each block has the
+ * largest size pushed so far in the command buffer (batch_push_max), and
+ * V3DV moves on by that size *before* it writes, so the last block ends at
+ * the sum of all blocks, minus the first one, plus the current largest size.
+ * dispatch_pipeline keeps that end within the budget.
+ *
+ * The 256 sets of a batch times the 16 bytes that were the most a layout
+ * could have are exactly 4096, which is why this never showed before layouts
+ * became general. */
+#define GPU_BATCH_PUSH_BYTES 4096
+
 /* ---- GPU Context (singleton) ---- */
 typedef struct {
   VkInstance instance;
@@ -55,10 +87,27 @@ typedef struct {
   VkQueue queue;
   uint32_t queue_family;
   VkCommandPool cmd_pool;
-  VkDescriptorSetLayout desc_layouts[LAYOUT_COUNT];
-  VkPipelineLayout pipe_layouts[LAYOUT_COUNT];
   VkDescriptorPool desc_pool;
   uint32_t max_workgroups;  /* maxComputeWorkGroupCount[0] */
+
+  /* ---- Layouts and what the device allows in one (see gpu_layout_get) ---- */
+  GpuLayout *layouts;                /* every layout created, until shutdown */
+  uint32_t max_storage_buffers;      /* in one layout */
+  uint32_t max_uniform_buffers;      /* in one layout */
+  uint32_t max_bindings;             /* storage and uniform buffers together */
+  uint32_t max_push_constant_size;   /* bytes */
+  uint32_t max_uniform_buffer_size;  /* bytes one uniform binding may cover */
+
+  /* ---- The descriptor pool's budget, per descriptor type ---- */
+  uint32_t pool_storage, pool_uniform;    /* descriptors the pool was created with */
+  uint32_t want_storage, want_uniform;    /* what the layouts so far ask for; the pool
+                                           * is replaced before the next set if it holds less */
+  uint32_t batch_storage, batch_uniform;  /* taken since the last pool reset */
+  VkDescriptorBufferInfo *set_infos;      /* scratch for one set's update, as wide */
+  VkWriteDescriptorSet   *set_writes;     /* as the widest layout */
+  uint32_t set_cap;
+  unsigned char *push_scratch;            /* as large as the largest push-constant block; */
+  uint32_t push_scratch_cap;              /* see the second push in dispatch_pipeline */
   int initialized;
   int init_failed;          /* a previous gpu_init raised; do not retry */
 
@@ -71,6 +120,9 @@ typedef struct {
   int      batch_recording;      /* batch_cmd is between vkBegin and vkEnd */
   uint32_t batch_dispatches;     /* recorded since the last flush (GPU.pending) */
   uint32_t batch_sets;           /* descriptor sets taken since the last pool reset */
+  uint32_t batch_push_bytes;     /* push constants recorded since the last flush, each block */
+  uint32_t batch_push_max;       /* counted at the largest size so far in the batch, */
+  uint32_t batch_push_first;     /* and the first block's size; see GPU_BATCH_PUSH_BYTES */
   uint32_t epoch;                /* batch number; bumped by every flush, never 0 */
   int      eager;                /* GPU.sync_mode = :eager -> flush after every dispatch */
   GpuBuffer **graveyard;         /* buffers whose Ruby owner died while a batch still referenced them */
@@ -95,8 +147,8 @@ const char *gpu_result_name(VkResult r);
 
 /* ---- gpu_vulkan.c ---- */
 
-/* Create the instance, device, queue, command pool, descriptor layouts and
- * pool. Raises on failure, and is attempted once per process. */
+/* Create the instance, device, queue, command pool and descriptor pool.
+ * Raises on failure, and is attempted once per process. */
 void gpu_init(mrb_state *mrb);
 
 /* gpu_init unless it has already run. Every entry point that needs the device
@@ -108,18 +160,27 @@ void gpu_ensure_initialized(mrb_state *mrb);
  * released their own Vulkan objects. */
 void gpu_shutdown(mrb_state *mrb);
 
-/* Create a compute pipeline from SPIR-V (`size` bytes of `code`) against one of
- * the fixed layouts. Returns the VkResult instead of raising, so a gem that
- * builds its pipelines up front can record which ones failed and report it
- * when they are used. On failure *out is VK_NULL_HANDLE. */
-VkResult gpu_create_pipeline(const uint32_t *code, size_t size, LayoutId lid,
+/* The layout for a description, created on first use. The caller has
+ * checked the description against the device's limits. Returns NULL and sets
+ * *result instead of raising, for the same reason as gpu_create_pipeline;
+ * *step then names what failed. */
+GpuLayout *gpu_layout_get(uint32_t storage_buffers, uint32_t uniform_buffers,
+                          uint32_t push_constant_size,
+                          VkResult *result, const char **step);
+
+/* Create a compute pipeline from SPIR-V (`size` bytes of `code`) against a
+ * layout. Returns the VkResult instead of raising, so a gem that builds its
+ * pipelines up front can record which ones failed and report it when they
+ * are used. On failure *out is VK_NULL_HANDLE. */
+VkResult gpu_create_pipeline(const uint32_t *code, size_t size, const GpuLayout *layout,
                              VkPipeline *out);
 
-/* Record one compute dispatch of `pipeline` (created against
- * g_ctx.pipe_layouts[lid]) over `bufs`, in binding order. Nothing is submitted
- * here unless GPU.sync_mode is :eager; see gpu_flush. */
-void dispatch_pipeline(mrb_state *mrb, VkPipeline pipeline, LayoutId lid,
-                       GpuBuffer **bufs, int num_buffers,
+/* Record one compute dispatch of `pipeline` (created against `layout`) over
+ * the layout's storage buffers `bufs` and uniform buffers `uniforms`, each in
+ * binding order. Nothing is submitted here unless GPU.sync_mode is :eager;
+ * see gpu_flush. */
+void dispatch_pipeline(mrb_state *mrb, VkPipeline pipeline, const GpuLayout *layout,
+                       GpuBuffer **bufs, GpuBuffer **uniforms,
                        const void *push_data, uint32_t push_size,
                        uint32_t group_x, uint32_t group_y, uint32_t group_z);
 
@@ -146,19 +207,31 @@ struct gpu_rt_context { GpuCtx *ctx; };
 
 /* ---- Pipelines made through gpu_rt_pipeline_create (gpu_api.c) ----
  *
- * The caller owns the struct and the runtime owns the VkPipeline, which is
- * why every live pipeline is on one list: shutdown destroys the Vulkan
- * objects of pipelines nobody released, and a release that comes later only
- * frees the struct. */
-struct gpu_rt_pipeline {
+ * The cache. A GpuPipeline is one VkPipeline, shared by every
+ * gpu_rt_pipeline_create call that gave the same SPIR-V and the same layout,
+ * and counted by `refs`. It is found again by `hash` and then a full compare
+ * of the kept copy of the code, and is destroyed when its last handle is
+ * released -- after the batch has run, if a recorded dispatch binds it.
+ *
+ * The runtime owns the VkPipeline, which is why every live GpuPipeline is on
+ * one list: shutdown destroys the Vulkan objects of pipelines nobody
+ * released, and a release that comes later only frees the structs. */
+typedef struct GpuPipeline {
   VkPipeline pipeline;       /* VK_NULL_HANDLE once the device is gone */
-  LayoutId   lid;            /* the fixed layout that serves this description */
-  uint32_t   storage_buffers;
-  uint32_t   push_constant_size;
+  const GpuLayout *layout;   /* NULL once the device is gone */
+  uint32_t  *spirv;          /* the code this was created from, for the compare */
+  size_t     spirv_size;     /* bytes */
+  uint64_t   hash;           /* of the code and the layout */
+  uint32_t   refs;           /* handles not yet released; 0 = waiting for the batch */
   uint32_t   epoch;          /* batch this pipeline was last dispatched in (0 = never) */
-  int        released;       /* the owner gave it back while a batch still used it */
-  char      *label;          /* mrb_malloc'ed copy, or NULL */
-  struct gpu_rt_pipeline *prev, *next;
+  struct GpuPipeline *prev, *next;
+} GpuPipeline;
+
+/* The public handle: one per gpu_rt_pipeline_create call, so each caller has
+ * a label of its own and releases only its own reference. */
+struct gpu_rt_pipeline {
+  GpuPipeline *shared;
+  char        *label;        /* mrb_malloc'ed copy, or NULL */
 };
 
 /* Destroy the pipelines that were released while the batch used them. Called

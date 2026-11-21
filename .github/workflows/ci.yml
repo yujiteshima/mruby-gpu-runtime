@@ -42,6 +42,29 @@ env:
   # Leave it empty (TEST_GEMS: '') when the gem has none.
   TEST_GEMS: test/capi
 
+  # The SPIR-V this repository ships: file patterns relative to the repository
+  # root, separated by spaces. The "Validate the SPIR-V" job runs spirv-val on
+  # every file they match, and fails if a pattern matches nothing.
+  #
+  # - A file whose name ends in .spv is a SPIR-V binary.
+  # - Any other file is a C header with one embedded module, as
+  #   `glslangValidator --vn` writes it: the job takes every 0x........ word in
+  #   it, in order. Here, those are the shaders of test/capi.
+  #
+  # Leave it empty (SPIRV_FILES: '') when the repository ships no SPIR-V.
+  SPIRV_FILES: test/capi/src/*_spv.h
+
+  # What spirv-val validates against (its --target-env). The runtime asks for
+  # Vulkan 1.1.
+  SPIRV_TARGET_ENV: vulkan1.1
+
+  # A shell command that creates the files of SPIRV_FILES, run from the
+  # repository root before spirv-val, for a gem that compiles its shaders
+  # instead of committing the SPIR-V (for example 'make -C shader').
+  # glslangValidator and make are installed. Empty here: the headers are
+  # committed.
+  SHADER_BUILD: ''
+
   # Gems that build on this one. Each line adds one suite, which builds those
   # gems on top of this checkout and runs their tests, so a change here that
   # breaks them shows up before it is merged. The format of a line is:
@@ -84,6 +107,67 @@ jobs:
                 end ]')
           echo "$suites" | jq .
           echo "suites=$suites" >> "$GITHUB_OUTPUT"
+
+  # spirv-val checks the shaders against the SPIR-V and Vulkan rules. A driver
+  # does not have to: it may accept an invalid module and misbehave later.
+  spirv:
+    name: Validate the SPIR-V
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install spirv-val
+        if: env.SPIRV_FILES != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends spirv-tools glslang-tools make ruby
+          spirv-val --version
+
+      - name: Build the shaders
+        if: env.SPIRV_FILES != '' && env.SHADER_BUILD != ''
+        run: bash -c "$SHADER_BUILD"
+
+      - name: Run spirv-val
+        if: env.SPIRV_FILES != ''
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/spirv"
+          # Split the input into patterns without expanding them yet, so a
+          # pattern that matches nothing is noticed.
+          set -f; patterns=($SPIRV_FILES); set +f
+          count=0
+          failed=0
+          for pattern in "${patterns[@]}"; do
+            files=$(compgen -G "$pattern" || true)
+            if [ -z "$files" ]; then
+              echo "::error::SPIRV_FILES: no file matches $pattern"
+              exit 1
+            fi
+            while IFS= read -r file; do
+              case "$file" in
+                *.spv) module=$file ;;
+                *)
+                  # An embedded module: write its words as a little-endian binary.
+                  module="$RUNNER_TEMP/spirv/$count.spv"
+                  ruby -e 'STDOUT.binmode; STDOUT.write(ARGF.read.scan(/0x\h{8}/).map(&:hex).pack("V*"))' "$file" > "$module"
+                  if [ ! -s "$module" ]; then
+                    echo "::error file=$file::SPIRV_FILES: $file has no 0x........ words"
+                    exit 1
+                  fi
+                  ;;
+              esac
+              count=$((count + 1))
+              if spirv-val --target-env "$SPIRV_TARGET_ENV" "$module"; then
+                echo "valid: $file ($(wc -c < "$module" | tr -d ' ') bytes)"
+              else
+                echo "::error file=$file::spirv-val rejected $file"
+                failed=$((failed + 1))
+              fi
+            done <<< "$files"
+          done
+          echo "spirv-val ($SPIRV_TARGET_ENV): $count modules, $failed rejected" >> "$GITHUB_STEP_SUMMARY"
+          [ "$failed" -eq 0 ]
 
   test:
     name: ${{ matrix.suite.name }} (mruby ${{ matrix.mruby }}, ${{ matrix.os }})
