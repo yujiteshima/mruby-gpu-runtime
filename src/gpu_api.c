@@ -33,6 +33,18 @@ void gpu_rt_require_at(mrb_state *mrb, int major, int minor, const char *file) {
   mrb_raise(mrb, E_RUNTIME_ERROR, msg);
 }
 
+/* ---- Errors ---- */
+
+/* Looked up by name each time rather than kept: the classes belong to one
+ * mrb_state, and this only runs on the way to a raise. */
+struct RClass *gpu_rt_error_class(mrb_state *mrb, gpu_rt_error_kind kind) {
+  static const char *const names[GPU_RT_ERROR_KIND_COUNT] = {
+    "Error", "DeviceError", "OutOfMemoryError", "UnsupportedError", "CompileError", "ShapeError"
+  };
+  if ((int)kind < 0 || kind >= GPU_RT_ERROR_KIND_COUNT) kind = GPU_RT_ERROR_GENERIC;
+  return mrb_class_get_under(mrb, mrb_module_get(mrb, "GPU"), names[kind]);
+}
+
 /* ---- Context ---- */
 
 static struct gpu_rt_context the_context = { &g_ctx };
@@ -179,13 +191,19 @@ static LayoutId layout_for(mrb_state *mrb, const gpu_rt_layout *layout, const ch
 static gpu_rt_pipeline *pipeline_failed(mrb_state *mrb, const char *label,
                                         const char *operation, const char *reason,
                                         VkResult r, gpu_rt_error *error_out) {
+  /* A shader the device does not take is a compile error, whatever result
+   * the driver chose for it; memory and the device keep their own classes. */
+  gpu_rt_error_kind kind = gpu_result_kind(r);
+  if (kind == GPU_RT_ERROR_GENERIC) kind = GPU_RT_ERROR_COMPILE;
   if (error_out) {
     error_out->operation = operation;
     error_out->reason = reason;
     error_out->vk_result = (int32_t)r;
+    error_out->kind = kind;
     return NULL;
   }
-  mrb_raisef(mrb, E_RUNTIME_ERROR, "gpu_rt_pipeline_create(%s): %s failed: %s (VkResult %d)",
+  mrb_raisef(mrb, gpu_rt_error_class(mrb, kind),
+             "gpu_rt_pipeline_create(%s): %s failed: %s (VkResult %d)",
              label, operation, reason, (int)r);
   return NULL;   /* not reached */
 }
@@ -295,7 +313,7 @@ void gpu_rt_dispatch(mrb_state *mrb, const gpu_rt_dispatch_desc *d) {
   const char *label = d->label ? d->label : (p->label ? p->label : "unnamed");
 
   if (p->pipeline == VK_NULL_HANDLE || p->released || !g_ctx.initialized) {
-    mrb_raisef(mrb, E_RUNTIME_ERROR,
+    mrb_raisef(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_GENERIC),
       "gpu_rt_dispatch(%s): the pipeline was released, or the device is gone", label);
   }
   if (d->buffer_count != p->storage_buffers || !d->buffers) {
@@ -325,7 +343,8 @@ void gpu_rt_dispatch(mrb_state *mrb, const gpu_rt_dispatch_desc *d) {
                     d->push_constants, d->push_constant_size,
                     d->groups[0],
                     d->groups[1] ? d->groups[1] : 1,
-                    d->groups[2] ? d->groups[2] : 1);
+                    d->groups[2] ? d->groups[2] : 1,
+                    label);
   /* Marked after the call: the core may flush inside it (an empty descriptor
    * pool before recording, :eager mode after), and what matters to a later
    * release is whether the batch being recorded now binds this pipeline. */

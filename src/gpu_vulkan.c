@@ -35,14 +35,67 @@ const char *gpu_result_name(VkResult r) {
     case VK_ERROR_TOO_MANY_OBJECTS:       return "too many objects";
     case VK_ERROR_FRAGMENTED_POOL:        return "descriptor pool fragmented";
     case VK_ERROR_UNKNOWN:                return "unknown error";
-    default:                              return "unrecognised VkResult";
+    default: break;
   }
+  /* Results newer than Vulkan 1.0, by value: an older SDK header may not
+   * name them, and a newer driver may still return them. */
+  switch ((int)r) {
+    case -11:         return "format not supported";      /* VK_ERROR_FORMAT_NOT_SUPPORTED */
+    case -1000012000: return "invalid shader";            /* VK_ERROR_INVALID_SHADER_NV */
+    case -1000069000: return "out of pool memory";        /* VK_ERROR_OUT_OF_POOL_MEMORY */
+    case -1000161000: return "fragmentation";             /* VK_ERROR_FRAGMENTATION */
+    default:          return "unrecognised VkResult";
+  }
+}
+
+/* Which exception class a VkResult stands for. Listed by value for the same
+ * reason as above. Anything not listed is GPU::Error itself, unless the
+ * caller knows more (gpu_fail during initialisation, gpu_rt_pipeline_create). */
+gpu_rt_error_kind gpu_result_kind(VkResult r) {
+  switch ((int)r) {
+    case -1:          /* VK_ERROR_OUT_OF_HOST_MEMORY */
+    case -2:          /* VK_ERROR_OUT_OF_DEVICE_MEMORY */
+    case -5:          /* VK_ERROR_MEMORY_MAP_FAILED: no address space left to map into */
+    case -10:         /* VK_ERROR_TOO_MANY_OBJECTS: e.g. more allocations than the device allows */
+    case -12:         /* VK_ERROR_FRAGMENTED_POOL */
+    case -1000069000: /* VK_ERROR_OUT_OF_POOL_MEMORY */
+    case -1000161000: /* VK_ERROR_FRAGMENTATION */
+      return GPU_RT_ERROR_OUT_OF_MEMORY;
+    case -3:          /* VK_ERROR_INITIALIZATION_FAILED */
+    case -4:          /* VK_ERROR_DEVICE_LOST */
+    case -9:          /* VK_ERROR_INCOMPATIBLE_DRIVER: no driver for the Vulkan asked for */
+      return GPU_RT_ERROR_DEVICE;
+    case -6:          /* VK_ERROR_LAYER_NOT_PRESENT */
+    case -7:          /* VK_ERROR_EXTENSION_NOT_PRESENT */
+    case -8:          /* VK_ERROR_FEATURE_NOT_PRESENT */
+    case -11:         /* VK_ERROR_FORMAT_NOT_SUPPORTED */
+      return GPU_RT_ERROR_UNSUPPORTED;
+    case -1000012000: /* VK_ERROR_INVALID_SHADER_NV */
+      return GPU_RT_ERROR_COMPILE;
+    default:
+      return GPU_RT_ERROR_GENERIC;
+  }
+}
+
+void gpu_fail(mrb_state *mrb, VkResult r, const char *call, const char *operation) {
+  gpu_rt_error_kind kind = gpu_result_kind(r);
+  /* gpu_init is the only caller before the context is ready, and whatever
+   * stops it leaves the process without a device. */
+  if (!g_ctx.initialized) {
+    if (kind == GPU_RT_ERROR_GENERIC) kind = GPU_RT_ERROR_DEVICE;
+    if (!operation) operation = "starting the GPU";
+  }
+  struct RClass *c = gpu_rt_error_class(mrb, kind);
+  if (operation) {
+    mrb_raisef(mrb, c, "%s: %s failed: %s (VkResult %d)",
+               operation, call, gpu_result_name(r), (int)r);
+  }
+  mrb_raisef(mrb, c, "%s failed: %s (VkResult %d)", call, gpu_result_name(r), (int)r);
 }
 
 void gpu_check(mrb_state *mrb, VkResult r, const char *call) {
   if (r == VK_SUCCESS) return;
-  mrb_raisef(mrb, E_RUNTIME_ERROR, "%s failed: %s (VkResult %d)",
-             call, gpu_result_name(r), (int)r);
+  gpu_fail(mrb, r, call, NULL);
 }
 
 /* Portability (MoltenVK on macOS) support. Absent on the Raspberry Pi's native
@@ -145,7 +198,7 @@ VkResult gpu_create_pipeline(const uint32_t *code, size_t size, LayoutId lid,
  * how map_buffer knows whether a flush is due, and how the GC finalizer knows
  * a buffer must outlive its Ruby owner until the batch has run. */
 
-static void batch_begin(mrb_state *mrb) {
+static void batch_begin(mrb_state *mrb, const char *op) {
   if (g_ctx.batch_recording) return;
   VkCommandBufferBeginInfo begin = {
     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -153,13 +206,14 @@ static void batch_begin(mrb_state *mrb) {
   };
   /* The pool was created with RESET_COMMAND_BUFFER_BIT, so beginning a
    * command buffer that has already been submitted resets it implicitly. */
-  VK_CHECK(mrb, vkBeginCommandBuffer(g_ctx.batch_cmd, &begin));
+  VkResult r = vkBeginCommandBuffer(g_ctx.batch_cmd, &begin);
+  if (r != VK_SUCCESS) gpu_fail(mrb, r, "vkBeginCommandBuffer", op);
   g_ctx.batch_recording = 1;
 }
 
 /* One descriptor set from the pool. A full pool just means the batch is
  * flushed a little early: the sets it held are released by the reset. */
-static VkDescriptorSet alloc_desc_set(mrb_state *mrb, LayoutId lid) {
+static VkDescriptorSet alloc_desc_set(mrb_state *mrb, LayoutId lid, const char *op) {
   if (g_ctx.batch_sets >= GPU_MAX_DESC_SETS) gpu_flush(mrb);
   VkDescriptorSetAllocateInfo dsai = {
     .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -178,7 +232,7 @@ static VkDescriptorSet alloc_desc_set(mrb_state *mrb, LayoutId lid) {
     gpu_flush(mrb);
     r = vkAllocateDescriptorSets(g_ctx.device, &dsai, &set);
   }
-  gpu_check(mrb, r, "vkAllocateDescriptorSets");
+  if (r != VK_SUCCESS) gpu_fail(mrb, r, "vkAllocateDescriptorSets", op);
   g_ctx.batch_sets++;
   return set;
 }
@@ -187,7 +241,8 @@ void dispatch_pipeline(
     mrb_state *mrb, VkPipeline pipeline, LayoutId lid,
     GpuBuffer **bufs, int num_buffers,
     const void *push_data, uint32_t push_size,
-    uint32_t group_x, uint32_t group_y, uint32_t group_z)
+    uint32_t group_x, uint32_t group_y, uint32_t group_z,
+    const char *label)
 {
   /* Exceeding maxComputeWorkGroupCount is invalid usage, and what happens is
    * up to the driver: lavapipe runs the dispatch anyway and returns the right
@@ -204,13 +259,18 @@ void dispatch_pipeline(
       (mrb_int)g_ctx.max_workgroups * 256);
   }
   if (pipeline == VK_NULL_HANDLE) {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "dispatch of a pipeline that was never created");
+    GPU_RAISE(mrb, GPU_RT_ERROR_GENERIC, "dispatch of a pipeline that was never created");
   }
   if (num_buffers < 1 || num_buffers > 3) {
     mrb_raisef(mrb, E_ARGUMENT_ERROR, "dispatch takes 1..3 buffers, got %d", num_buffers);
   }
 
-  VkDescriptorSet desc_set = alloc_desc_set(mrb, lid);
+  /* What a Vulkan failure below is reported under: the same prefix as the
+   * checks in gpu_rt_dispatch. */
+  char op[96];
+  snprintf(op, sizeof(op), "gpu_rt_dispatch(%s)", label ? label : "unnamed");
+
+  VkDescriptorSet desc_set = alloc_desc_set(mrb, lid, op);
 
   VkDescriptorBufferInfo buf_infos[3];
   VkWriteDescriptorSet writes[3];
@@ -227,7 +287,7 @@ void dispatch_pipeline(
   }
   vkUpdateDescriptorSets(g_ctx.device, num_buffers, writes, 0, NULL);
 
-  batch_begin(mrb);
+  batch_begin(mrb, op);
   VkCommandBuffer cmd = g_ctx.batch_cmd;
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -308,7 +368,7 @@ void gpu_flush(mrb_state *mrb) {
   bury_graveyard(mrb);
   gpu_pipelines_sweep(mrb);
 
-  if (step) gpu_check(mrb, r, step);
+  if (step && r != VK_SUCCESS) gpu_fail(mrb, r, step, "running the batch");
 }
 
 void gpu_sync_buffer(mrb_state *mrb, GpuBuffer *buf) {
@@ -322,7 +382,7 @@ void gpu_init(mrb_state *mrb) {
    * the failed attempt created -- once per operation, since initialization is
    * lazy. One attempt per process; fix the environment and restart. */
   if (g_ctx.init_failed) {
-    mrb_raise(mrb, E_RUNTIME_ERROR,
+    GPU_RAISE(mrb, GPU_RT_ERROR_DEVICE,
       "GPU initialization already failed in this process and is not retried");
   }
   g_ctx.init_failed = 1;   /* cleared only on the success path at the end */
@@ -358,11 +418,11 @@ void gpu_init(mrb_state *mrb) {
   uint32_t dev_count = 0;
   VK_CHECK(mrb, vkEnumeratePhysicalDevices(g_ctx.instance, &dev_count, NULL));
   if (dev_count == 0) {
-    mrb_raise(mrb, E_RUNTIME_ERROR,
+    GPU_RAISE(mrb, GPU_RT_ERROR_DEVICE,
       "no Vulkan physical device found (is a Vulkan driver installed?)");
   }
   VkPhysicalDevice *devs = malloc(sizeof(VkPhysicalDevice) * dev_count);
-  if (!devs) mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory enumerating devices");
+  if (!devs) GPU_RAISE(mrb, GPU_RT_ERROR_OUT_OF_MEMORY, "out of memory enumerating devices");
   VkResult dev_r = vkEnumeratePhysicalDevices(g_ctx.instance, &dev_count, devs);
   if (dev_r != VK_SUCCESS) {
     free(devs);
@@ -389,7 +449,7 @@ void gpu_init(mrb_state *mrb) {
   uint32_t qf_count = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(g_ctx.physical_device, &qf_count, NULL);
   VkQueueFamilyProperties *qf_props = malloc(sizeof(VkQueueFamilyProperties) * qf_count);
-  if (!qf_props) mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory enumerating queue families");
+  if (!qf_props) GPU_RAISE(mrb, GPU_RT_ERROR_OUT_OF_MEMORY, "out of memory enumerating queue families");
   vkGetPhysicalDeviceQueueFamilyProperties(g_ctx.physical_device, &qf_count, qf_props);
   int have_compute = 0;
   g_ctx.queue_family = 0;
@@ -402,7 +462,7 @@ void gpu_init(mrb_state *mrb) {
   }
   free(qf_props);
   if (!have_compute) {
-    mrb_raisef(mrb, E_RUNTIME_ERROR,
+    mrb_raisef(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_DEVICE),
       "device '%s' has no compute-capable queue family", dev_props.deviceName);
   }
 
