@@ -86,7 +86,6 @@ jobs:
       SUITE_TEST: ${{ matrix.suite.test }}
       SUITE_REPOS: ${{ matrix.suite.repos }}
       MRUBY_VERSION: ${{ matrix.mruby }}
-      GEMS_DIR: ${{ runner.temp }}/gems
 
     steps:
       - uses: actions/checkout@v7
@@ -109,11 +108,11 @@ jobs:
       - name: Fetch the downstream gems
         if: matrix.suite.repos != ''
         run: |
-          mkdir -p "$GEMS_DIR"
+          mkdir -p "$RUNNER_TEMP/gems"
           for spec in $SUITE_REPOS; do
             repo=${spec%%@*}
             branch=${spec#*@}
-            dir="$GEMS_DIR/${repo##*/}"
+            dir="$RUNNER_TEMP/gems/${repo##*/}"
             git clone --quiet --depth 1 --branch "$branch" "https://github.com/$repo.git" "$dir"
             echo "$spec: $(git -C "$dir" log -1 --format='%h %s')"
           done
@@ -131,7 +130,7 @@ jobs:
             echo "  conf.gem '$GITHUB_WORKSPACE'"
             for spec in $SUITE_REPOS; do
               repo=${spec%%@*}
-              echo "  conf.gem '$GEMS_DIR/${repo##*/}'"
+              echo "  conf.gem '$RUNNER_TEMP/gems/${repo##*/}'"
             done
             echo "end"
           } > "$RUNNER_TEMP/build_config.rb"
@@ -157,7 +156,7 @@ jobs:
           if [ -n "$SUITE_REPOS" ]; then
             last=${SUITE_REPOS##* }
             repo=${last%%@*}
-            cd "$GEMS_DIR/${repo##*/}"
+            cd "$RUNNER_TEMP/gems/${repo##*/}"
           fi
           "$RUNNER_TEMP/mruby/build/host/bin/mruby" "$SUITE_TEST" | tee "$RUNNER_TEMP/test.log"
           echo "$SUITE_NAME, mruby $MRUBY_VERSION, $RUNNER_ARCH: $(grep -E '^[0-9]+ tests, ' "$RUNNER_TEMP/test.log" | tail -1)" >> "$GITHUB_STEP_SUMMARY"
