@@ -41,8 +41,8 @@ env:
   #
   # Leave it empty (DOWNSTREAM: '') when no gem builds on this one.
   DOWNSTREAM: |
-    narray test/narray_test.rb yujiteshima/mruby-gpu-narray@yujiteshima/build-on-runtime-mrbgpu-9
-    kernel test/kernel_test.rb yujiteshima/mruby-gpu-narray@yujiteshima/build-on-runtime-mrbgpu-9 yujiteshima/mruby-gpu-kernel@main
+    narray test/narray_test.rb yujiteshima/mruby-gpu-narray@main
+    kernel test/kernel_test.rb yujiteshima/mruby-gpu-narray@main yujiteshima/mruby-gpu-kernel@main
 # ---- End of inputs ----
 
 jobs:
