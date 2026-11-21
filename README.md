@@ -11,7 +11,6 @@ The Vulkan core of mruby-gpu-narray now lives here: device and queue setup, buff
 - The C API is `include/gpu_runtime.h`: opaque handles for the context, buffers and pipelines, and functions that start with `gpu_rt_`. It is at API version 0.1 and may still change; see [Writing a gem on the C API](#writing-a-gem-on-the-c-api).
 - A pipeline's layout is described by value, and today it can be one, two or three storage buffers plus up to 16 bytes of push constants.
 - Each buffer has a `VkDeviceMemory` of its own; there is no memory pool yet.
-- `include/gpu_runtime_legacy.h` holds the declarations from before the C API (the context and buffer structs). `gpu_runtime.h` still includes it, so that mruby-gpu-narray and mruby-gpu-kernel build while they move to the C API. It is deleted once both have moved, so do not build on it.
 
 ## What it will provide
 

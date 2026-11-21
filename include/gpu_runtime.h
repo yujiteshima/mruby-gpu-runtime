@@ -306,15 +306,4 @@ uint32_t gpu_rt_pending(mrb_state *mrb, gpu_rt_context *ctx);
 }
 #endif
 
-/* ---- Going away ----
- *
- * The declarations this header had before the functions above existed: the
- * context and the buffer as plain structs. They are still here so that the
- * main branches of mruby-gpu-narray and mruby-gpu-kernel keep building while
- * they move to this API, and they are removed once both have. Define
- * GPU_RT_NO_LEGACY before including this header to see it as it will be. */
-#ifndef GPU_RT_NO_LEGACY
-#include "gpu_runtime_legacy.h"
-#endif
-
 #endif

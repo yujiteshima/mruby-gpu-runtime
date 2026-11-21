@@ -12,9 +12,10 @@
  * create buffers.
  *
  * Every buffer ends up owned by a Ruby object and freed by the GC finalizer.
- * Callers wrap as soon as create_buffer returns, before anything that can
- * raise, so a Vulkan failure unwinds without stranding GPU memory.
- * destroy_buffer is the finalizer itself, plus create_buffer's own unwind.
+ * Callers wrap as soon as gpu_rt_buffer_create returns, before anything that
+ * can raise, so a Vulkan failure unwinds without stranding GPU memory.
+ * destroy_buffer is the finalizer itself, and gpu_rt_buffer_release for a
+ * buffer that was never wrapped.
  *
  * With deferred submission a buffer can be referenced by a command buffer that
  * has not run yet. Two rules keep that safe:
@@ -44,9 +45,6 @@ GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t u
   GpuBuffer *buf = mrb_malloc(mrb, sizeof(GpuBuffer));
   buf->size = size;
   buf->usage = usage;
-  /* What the legacy callers read. They only ever see float32 arrays, which
-   * narray keeps below 2^32 elements. */
-  buf->n = (size / sizeof(float) > UINT32_MAX) ? UINT32_MAX : (uint32_t)(size / sizeof(float));
   buf->buffer = VK_NULL_HANDLE;
   buf->memory = VK_NULL_HANDLE;
   buf->bytes = size;
@@ -114,11 +112,6 @@ GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t u
   return buf;
 }
 
-/* The legacy entry point: n float32 elements. */
-GpuBuffer *create_buffer(mrb_state *mrb, uint32_t n) {
-  return gpu_buffer_create_bytes(mrb, sizeof(float) * (VkDeviceSize)n, GPU_RT_BUFFER_STORAGE);
-}
-
 /* ---- Free a buffer's GPU resources + the struct itself ----
  *
  * Runs as the GC finalizer, so it must not raise and must not block: a buffer
@@ -163,10 +156,10 @@ mrb_value wrap_buffer(mrb_state *mrb, struct RClass *klass, GpuBuffer *buf) {
  * This is the sync point of the whole library: the host is about to look at
  * (or change) the bytes, so any queued dispatch that reads or writes this
  * buffer has to run first. A buffer the batch never touched maps at once. */
-float *map_buffer(mrb_state *mrb, GpuBuffer *buf) {
+void *map_buffer(mrb_state *mrb, GpuBuffer *buf) {
   gpu_sync_buffer(mrb, buf);
-  float *mapped = NULL;
-  VK_CHECK(mrb, vkMapMemory(g_ctx.device, buf->memory, 0, buf->bytes, 0, (void **)&mapped));
+  void *mapped = NULL;
+  VK_CHECK(mrb, vkMapMemory(g_ctx.device, buf->memory, 0, buf->bytes, 0, &mapped));
   if (!mapped) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "vkMapMemory returned no pointer");
   }
