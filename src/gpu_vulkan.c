@@ -5,7 +5,7 @@
  * What stayed behind in narray is its own table of built-in pipelines: the
  * runtime knows the three descriptor layouts, not which shaders use them.
  */
-#include "gpu_runtime.h"
+#include "gpu_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -306,6 +306,7 @@ void gpu_flush(mrb_state *mrb) {
   }
   g_ctx.epoch++;
   bury_graveyard(mrb);
+  gpu_pipelines_sweep(mrb);
 
   if (step) gpu_check(mrb, r, step);
 }
@@ -526,6 +527,7 @@ void gpu_shutdown(mrb_state *mrb) {
    * is waited on before gpu_flush returns. */
   g_ctx.batch_recording = 0;
   bury_graveyard(mrb);
+  gpu_pipelines_shutdown(mrb);
   free(g_ctx.graveyard);
   g_ctx.graveyard = NULL;
   g_ctx.graveyard_cap = 0;
