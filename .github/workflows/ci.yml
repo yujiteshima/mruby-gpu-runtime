@@ -1,0 +1,165 @@
+# CI for an mruby GPU gem, on Mesa lavapipe.
+#
+# This file is a template. To use it in another GPU gem, copy it and change the
+# three values under "Inputs". docs/ci-template.md in mruby-gpu-runtime has the
+# details.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ---- Inputs: change these when you copy this file to another gem ----
+env:
+  # The name in this repository's mrbgem.rake.
+  GEM_NAME: mruby-gpu-runtime
+
+  # This gem's test script, relative to the repository root. Its last line of
+  # output must be "ALL TESTS PASSED" when every test passes.
+  TEST_FILE: test/runtime_test.rb
+
+  # Gems that build on this one. Each line adds one suite, which builds those
+  # gems on top of this checkout and runs their tests, so a change here that
+  # breaks them shows up before it is merged. The format of a line is:
+  #
+  #   <suite name> <test file> <owner/repository@branch> [<owner/repository@branch> ...]
+  #
+  # - The repositories are cloned and listed in the build configuration by
+  #   path, in the order given, after this checkout. List a gem after the gems
+  #   it depends on.
+  # - The test file is relative to the root of the last repository on the line.
+  # - Always name the branch.
+  #
+  # Leave it empty (DOWNSTREAM: '') when no gem builds on this one.
+  DOWNSTREAM: |
+    narray test/narray_test.rb yujiteshima/mruby-gpu-narray@main
+    kernel test/kernel_test.rb yujiteshima/mruby-gpu-narray@main yujiteshima/mruby-gpu-kernel@main
+# ---- End of inputs ----
+
+jobs:
+  # The matrix below cannot read `env`, so this job turns the inputs into the
+  # list of suites: this gem's own tests first, then one suite per DOWNSTREAM line.
+  suites:
+    name: Read the inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      suites: ${{ steps.suites.outputs.suites }}
+    steps:
+      - name: List the suites
+        id: suites
+        run: |
+          suites=$(jq -cn --arg gem "$GEM_NAME" --arg test "$TEST_FILE" --arg downstream "$DOWNSTREAM" '
+            [{name: $gem, test: $test, repos: ""}] +
+            [ $downstream | split("\n")[]
+              | [splits("[ \t]+")] | map(select(. != ""))
+              | select(length > 0)
+              | if length < 3 or any(.[2:][]; test("^[^/@]+/[^/@]+@.+$") | not)
+                then error("DOWNSTREAM: expected <suite name> <test file> <owner/repository@branch>..., got: " + join(" "))
+                else {name: .[0], test: .[1], repos: (.[2:] | join(" "))}
+                end ]')
+          echo "$suites" | jq .
+          echo "suites=$suites" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: ${{ matrix.suite.name }} (mruby ${{ matrix.mruby }}, ${{ matrix.os }})
+    needs: suites
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        mruby: ['3.4.0', '4.0.0']
+        suite: ${{ fromJSON(needs.suites.outputs.suites) }}
+    env:
+      SUITE_NAME: ${{ matrix.suite.name }}
+      SUITE_TEST: ${{ matrix.suite.test }}
+      SUITE_REPOS: ${{ matrix.suite.repos }}
+      MRUBY_VERSION: ${{ matrix.mruby }}
+      GEMS_DIR: ${{ runner.temp }}/gems
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the toolchain and Mesa lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison ruby rake \
+            mesa-vulkan-drivers libvulkan-dev glslang-tools vulkan-tools
+          # GitHub-hosted runners have no GPU, so Vulkan runs on lavapipe, Mesa's CPU
+          # implementation. Its ICD file is lvp_icd.x86_64.json on x64 and
+          # lvp_icd.json on arm64. glslang-tools is for gems that compile shaders,
+          # at build time (mruby-gpu-narray) or at run time (mruby-gpu-kernel).
+          echo "VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)" >> "$GITHUB_ENV"
+
+      - name: Show the Vulkan device
+        run: vulkaninfo --summary | grep -E 'deviceName|driverName|apiVersion'
+
+      - name: Fetch the downstream gems
+        if: matrix.suite.repos != ''
+        run: |
+          mkdir -p "$GEMS_DIR"
+          for spec in $SUITE_REPOS; do
+            repo=${spec%%@*}
+            branch=${spec#*@}
+            dir="$GEMS_DIR/${repo##*/}"
+            git clone --quiet --depth 1 --branch "$branch" "https://github.com/$repo.git" "$dir"
+            echo "$spec: $(git -C "$dir" log -1 --format='%h %s')"
+          done
+
+      - name: Build mruby ${{ matrix.mruby }}
+        # This checkout is listed by path, and first. A downstream gem that
+        # names this gem as a GitHub dependency then gets this checkout instead,
+        # so the code under test is the code in the pull request.
+        run: |
+          git clone --quiet --depth 1 --branch "$MRUBY_VERSION" https://github.com/mruby/mruby.git "$RUNNER_TEMP/mruby"
+          {
+            echo "MRuby::Build.new do |conf|"
+            echo "  toolchain :gcc"
+            echo "  conf.gembox 'default'"
+            echo "  conf.gem '$GITHUB_WORKSPACE'"
+            for spec in $SUITE_REPOS; do
+              repo=${spec%%@*}
+              echo "  conf.gem '$GEMS_DIR/${repo##*/}'"
+            done
+            echo "end"
+          } > "$RUNNER_TEMP/build_config.rb"
+          cat "$RUNNER_TEMP/build_config.rb"
+          cd "$RUNNER_TEMP/mruby"
+          MRUBY_CONFIG="$RUNNER_TEMP/build_config.rb" rake -j"$(nproc)"
+
+          # Gems that mruby fetched itself, for dependencies not listed above.
+          # This gem must not be one of them.
+          for dir in build/repos/host/*/; do
+            [ -d "$dir/.git" ] || continue
+            echo "fetched by mruby: $(basename "$dir") $(git -C "$dir" log -1 --format='%h %s')"
+          done
+          if [ -e "build/repos/host/$GEM_NAME" ]; then
+            echo "::error::mruby fetched its own copy of $GEM_NAME, so this checkout was not the one tested"
+            exit 1
+          fi
+
+      - name: Test
+        shell: bash
+        run: |
+          # Run from the root of the gem that owns the test file.
+          if [ -n "$SUITE_REPOS" ]; then
+            last=${SUITE_REPOS##* }
+            repo=${last%%@*}
+            cd "$GEMS_DIR/${repo##*/}"
+          fi
+          "$RUNNER_TEMP/mruby/build/host/bin/mruby" "$SUITE_TEST" | tee "$RUNNER_TEMP/test.log"
+          echo "$SUITE_NAME, mruby $MRUBY_VERSION, $RUNNER_ARCH: $(grep -E '^[0-9]+ tests, ' "$RUNNER_TEMP/test.log" | tail -1)" >> "$GITHUB_STEP_SUMMARY"
+          # The test script prints a summary but exits 0 either way, so check its last line.
+          grep -qx 'ALL TESTS PASSED' "$RUNNER_TEMP/test.log"
