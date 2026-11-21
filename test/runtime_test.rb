@@ -40,9 +40,118 @@ def assert_raise(label, klass)
   ng(label, "expected #{klass}, but nothing was raised")
 end
 
+# ---- choosing the device, before it starts ----
+#
+# These come first: GPU.info below starts the device, and then it cannot
+# change. They end by going back to the default, so the rest of this file runs
+# on the device a program that chooses nothing gets (MRUBY_GPU_DEVICE, or the
+# first device that is not a CPU).
+CAPI = Object.const_defined?(:GPURuntimeTest)
+DEVICE_TYPES = [:integrated, :discrete, :virtual, :cpu, :other]
+
+devices = GPU.devices
+assert_true("GPU.devices is a non-empty Array", devices.is_a?(Array) && !devices.empty?,
+            devices.inspect)
+assert_true("each device has its index, a name and a type",
+            devices.each_with_index.all? { |d, i|
+              d.is_a?(Hash) && d[:index] == i && d[:name].is_a?(String) && !d[:name].empty? &&
+                DEVICE_TYPES.include?(d[:type])
+            }, devices.inspect)
+assert_true("GPU.devices does not start the device", !GPURuntimeTest.ready?) if CAPI
+
+def assert_raise_with(label, klass, *parts)
+  begin
+    yield
+  rescue => e
+    return ng(label, "expected #{klass}, got #{e.class}: #{e.message}") unless e.is_a?(klass)
+    missing = parts.reject { |p| e.message.include?(p) }
+    return ok(label) if missing.empty?
+    return ng(label, "message lacks #{missing.inspect}: #{e.message.inspect}")
+  end
+  ng(label, "expected #{klass}, but nothing was raised")
+end
+
+last = devices[-1]
+assert_raise_with("a name no device has -> ArgumentError that lists the devices", ArgumentError,
+                  "no such device", "0: \"#{devices[0][:name]}\"", devices[0][:type].to_s) do
+  GPU.device = "no such device"
+end
+assert_raise_with("an empty name -> ArgumentError", ArgumentError, "name") { GPU.device = "" }
+assert_raise_with("an index past the last device -> ArgumentError", ArgumentError,
+                  devices.size.to_s, last[:name]) { GPU.device = devices.size }
+assert_raise_with("a negative index -> ArgumentError", ArgumentError, "-1") { GPU.device = -1 }
+assert_raise_with("neither an index nor a name -> TypeError", TypeError, "Symbol") { GPU.device = :gpu }
+assert_true("a device is chosen by index", (GPU.device = last[:index]) == last[:index])
+assert_true("a device is chosen by its name", (GPU.device = devices[0][:name]) == devices[0][:name])
+assert_true("a name matches without regard to case, and as a part of the device's name",
+            (GPU.device = last[:name].upcase) && (GPU.device = last[:name][0, 3].downcase))
+assert_true("choosing does not start the device", !GPURuntimeTest.ready?) if CAPI
+env = CAPI ? GPURuntimeTest.device_env : nil
+env_is_index = env && env.each_char.all? { |c| "0123456789".include?(c) }   # no Regexp in the default gems
+if env && !(env_is_index ? env.to_i < devices.size
+                         : devices.any? { |d| d[:name].downcase.include?(env.downcase) })
+  # The person running this named a device that is not here. Check the error,
+  # then run the rest on a device chosen in the script, which wins.
+  assert_raise_with("MRUBY_GPU_DEVICE that matches no device -> RuntimeError", RuntimeError,
+                    "MRUBY_GPU_DEVICE", env, devices[0][:name]) { GPU.device = nil }
+  assert_raise_with("and the same when the device starts", RuntimeError, "MRUBY_GPU_DEVICE") { GPU.info }
+  assert_true("a failed start can be followed by a choice", (GPU.device = 0) == 0)
+  env = nil
+  default_fails = true
+  expected = devices[0]
+else
+  default_fails = false
+  assert_true("nil goes back to the default", (GPU.device = nil).nil?)
+  expected = if env
+    env_is_index ? devices[env.to_i] :
+      (devices.find { |d| d[:name].downcase == env.downcase } ||
+       devices.find { |d| d[:name].downcase.include?(env.downcase) })
+  else
+    devices.find { |d| d[:type] != :cpu } || devices[0]
+  end
+end
+
 info = GPU.info
 puts "device: #{info[:device]} (#{info[:backend]} #{info[:api_version]})"
+puts "devices: #{devices.map { |d| "#{d[:index]}: #{d[:name]} (#{d[:type]})" }.join(", ")}"
+puts "MRUBY_GPU_DEVICE=#{env}" if env
+puts "features: #{info[:features].inspect}"
 puts
+
+# ---- the device in use ----
+assert_true(env ? "the device is the one MRUBY_GPU_DEVICE names"
+                : "the default device is the first that is not a CPU",
+            info[:device_index] == expected[:index], info[:device_index].inspect)
+assert_true("GPU.info names the device GPU.devices lists at :device_index",
+            info[:device] == expected[:name] && info[:device_type] == expected[:type],
+            [info[:device], info[:device_type]].inspect)
+assert_true("the device in use can be chosen again, by index and by name",
+            (GPU.device = info[:device_index]) && (GPU.device = info[:device]))
+if default_fails
+  assert_raise_with("nil after the start, with MRUBY_GPU_DEVICE matching nothing -> RuntimeError",
+                    RuntimeError, "MRUBY_GPU_DEVICE") { GPU.device = nil }
+else
+  assert_true("and by nil, when it is the default", (GPU.device = nil).nil?)
+end
+other = devices.find { |d| d[:index] != info[:device_index] && d[:name] != info[:device] }
+if other
+  assert_raise_with("another device, after the start -> RuntimeError", RuntimeError,
+                    "already started", info[:device]) { GPU.device = other[:index] }
+  assert_raise_with("and by name", RuntimeError, "already started") { GPU.device = other[:name] }
+else
+  puts "NOTE  one device here: refusing another device after the start is not tested"
+end
+assert_raise_with("a name no device has, after the start -> ArgumentError", ArgumentError,
+                  "no such device") { GPU.device = "no such device" }
+assert_true("a refused choice leaves the device as it was", GPU.info[:device_index] == info[:device_index])
+
+# ---- features ----
+FEATURE_KEYS = [:storage_8bit, :timestamp_query, :subgroups, :memory_budget]
+feats = info[:features]
+assert_true("GPU.info[:features] has exactly the four documented keys",
+            feats.is_a?(Hash) && feats.keys == FEATURE_KEYS, feats.inspect)
+assert_true("each feature is true or false",
+            feats.is_a?(Hash) && feats.values.all? { |v| v == true || v == false }, feats.inspect)
 
 # ---- device information ----
 assert_true("GPU.info is a Hash", info.is_a?(Hash), info.class.to_s)
@@ -111,9 +220,12 @@ if Object.const_defined?(:GPURuntimeTest)
   assert_true("gpu_rt_context_info agrees with GPU.info",
               di[:name] == info[:device] && di[:backend] == info[:backend] &&
               di[:api].join(".") == info[:api_version] &&
-              di[:max_workgroups] == info[:max_workgroups], di.inspect)
-  assert_true("no feature is reported yet, and an unknown one is false",
-              T.features.all? { |f| f == false }, T.features.inspect)
+              di[:max_workgroups] == info[:max_workgroups] &&
+              di[:index] == info[:device_index] && di[:type] == info[:device_type], di.inspect)
+  assert_true("gpu_rt_context_has_feature agrees with GPU.info[:features], in the enum's order",
+              T.features[0, 4] == FEATURE_KEYS.map { |k| feats[k] }, T.features.inspect)
+  assert_true("an unknown feature is false", T.features.size == 5 && T.features[4] == false,
+              T.features.inspect)
   assert_raise_message("a context handle that is not the runtime's -> ArgumentError",
                        ArgumentError, "gpu_rt_sync", "gpu_rt_context_get") { T.sync_bad_context }
 
