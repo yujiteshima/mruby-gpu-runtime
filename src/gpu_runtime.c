@@ -4,7 +4,7 @@
  * Vulkan core, because they describe the device and the shared batch rather
  * than arrays. Their behaviour is unchanged.
  */
-#include "gpu_runtime.h"
+#include "gpu_internal.h"
 #include <mruby/hash.h>
 #include <mruby/string.h>
 #include <stdio.h>

@@ -6,9 +6,10 @@
  * unified, so a mapped pointer is a cheap view of the same bytes the shader
  * reads/writes.
  *
- * Each buffer still gets a VkDeviceMemory of its own. There is no pool and no
- * VMA yet; keeping the allocator inside this file means either can be added
- * later without changing the gems that create buffers.
+ * Each buffer gets a VkDeviceMemory of its own. There is no pool, and VMA is
+ * not bundled; the allocation stays inside this file and behind the opaque
+ * gpu_rt_buffer handle, so it can change without changing the gems that
+ * create buffers.
  *
  * Every buffer ends up owned by a Ruby object and freed by the GC finalizer.
  * Callers wrap as soon as create_buffer returns, before anything that can
@@ -23,7 +24,7 @@
  *   - destroy_buffer parks such a buffer in the graveyard instead of freeing
  *     it; gpu_flush frees the graveyard once the batch has completed.
  */
-#include "gpu_runtime.h"
+#include "gpu_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -34,17 +35,21 @@ static void gpu_buffer_free(mrb_state *mrb, void *p) {
 
 const struct mrb_data_type gpu_buffer_type = {"GPU::NArray", gpu_buffer_free};
 
-/* ---- Create a host-visible FP32 buffer of n elements ----
+/* ---- Create a host-visible buffer of `size` bytes ----
  *
  * Raises rather than returning a half-built buffer. Because a raise unwinds
  * out of this function, each step releases what earlier steps created before
  * handing the failure to gpu_check. */
-GpuBuffer *create_buffer(mrb_state *mrb, uint32_t n) {
+GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t usage) {
   GpuBuffer *buf = mrb_malloc(mrb, sizeof(GpuBuffer));
-  buf->n = n;
+  buf->size = size;
+  buf->usage = usage;
+  /* What the legacy callers read. They only ever see float32 arrays, which
+   * narray keeps below 2^32 elements. */
+  buf->n = (size / sizeof(float) > UINT32_MAX) ? UINT32_MAX : (uint32_t)(size / sizeof(float));
   buf->buffer = VK_NULL_HANDLE;
   buf->memory = VK_NULL_HANDLE;
-  buf->bytes = sizeof(float) * (VkDeviceSize)n;
+  buf->bytes = size;
   buf->epoch = 0;   /* never bound; no batch can be waiting on it */
   if (buf->bytes == 0) buf->bytes = sizeof(float); /* avoid zero-size allocation */
 
@@ -107,6 +112,11 @@ GpuBuffer *create_buffer(mrb_state *mrb, uint32_t n) {
   }
 
   return buf;
+}
+
+/* The legacy entry point: n float32 elements. */
+GpuBuffer *create_buffer(mrb_state *mrb, uint32_t n) {
+  return gpu_buffer_create_bytes(mrb, sizeof(float) * (VkDeviceSize)n, GPU_RT_BUFFER_STORAGE);
 }
 
 /* ---- Free a buffer's GPU resources + the struct itself ----
