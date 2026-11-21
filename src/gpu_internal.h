@@ -55,6 +55,30 @@ extern const struct mrb_data_type gpu_buffer_type;
 #define GPU_POOL_DESCRIPTORS 16384
 #define GPU_POOL_MIN_SETS 8
 
+/* Bytes of push constants one batch may carry. A batch that needs more is
+ * flushed early, like one that needs more descriptor sets.
+ *
+ * This is a limit of Mesa V3DV (seen in 25.2.8, and unchanged on Mesa main in
+ * November 2026), kept on every device so that a batch behaves the same
+ * everywhere. When a shader reads its push constants with an index that is
+ * not constant, V3DV copies every dispatch's block into one 4096-byte buffer
+ * per command buffer (check_push_constants_ubo in v3dv_uniforms.c). Its check
+ * for a full buffer is off by one block, and the buffer it then adds is
+ * written at the old offset, so the block that crosses 4096 bytes and every
+ * one after it lands outside the buffer: first a dispatch that silently does
+ * nothing, then a crash.
+ *
+ * The runtime counts the way V3DV places the blocks. Each block has the
+ * largest size pushed so far in the command buffer (batch_push_max), and
+ * V3DV moves on by that size *before* it writes, so the last block ends at
+ * the sum of all blocks, minus the first one, plus the current largest size.
+ * dispatch_pipeline keeps that end within the budget.
+ *
+ * The 256 sets of a batch times the 16 bytes that were the most a layout
+ * could have are exactly 4096, which is why this never showed before layouts
+ * became general. */
+#define GPU_BATCH_PUSH_BYTES 4096
+
 /* ---- GPU Context (singleton) ---- */
 typedef struct {
   VkInstance instance;
@@ -82,6 +106,8 @@ typedef struct {
   VkDescriptorBufferInfo *set_infos;      /* scratch for one set's update, as wide */
   VkWriteDescriptorSet   *set_writes;     /* as the widest layout */
   uint32_t set_cap;
+  unsigned char *push_scratch;            /* as large as the largest push-constant block; */
+  uint32_t push_scratch_cap;              /* see the second push in dispatch_pipeline */
   int initialized;
   int init_failed;          /* a previous gpu_init raised; do not retry */
 
@@ -94,6 +120,9 @@ typedef struct {
   int      batch_recording;      /* batch_cmd is between vkBegin and vkEnd */
   uint32_t batch_dispatches;     /* recorded since the last flush (GPU.pending) */
   uint32_t batch_sets;           /* descriptor sets taken since the last pool reset */
+  uint32_t batch_push_bytes;     /* push constants recorded since the last flush, each block */
+  uint32_t batch_push_max;       /* counted at the largest size so far in the batch, */
+  uint32_t batch_push_first;     /* and the first block's size; see GPU_BATCH_PUSH_BYTES */
   uint32_t epoch;                /* batch number; bumped by every flush, never 0 */
   int      eager;                /* GPU.sync_mode = :eager -> flush after every dispatch */
   GpuBuffer **graveyard;         /* buffers whose Ruby owner died while a batch still referenced them */

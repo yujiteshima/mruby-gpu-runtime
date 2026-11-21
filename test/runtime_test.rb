@@ -283,6 +283,34 @@ if Object.const_defined?(:GPURuntimeTest)
   600.times { acc4 = T.blend(acc4, acc4, acc4, w, 1.0, [0, 0, 0, 0]) }
   assert_true("600 chained dispatches of the wider layout, more than the descriptor pool holds",
               acc4.read == [600.0, 600.0, 600.0, 600.0], acc4.read.inspect)
+  # A batch carries at most 4096 bytes of push constants (GPU_BATCH_PUSH_BYTES in
+  # src/gpu_internal.h): Mesa V3DV writes outside its buffer beyond that, when the
+  # shader indexes its push constants as blend does. 128 dispatches of blend's 32
+  # bytes fill a batch, so the 129th starts a new one.
+  GPU.sync
+  acc4 = B.floats(4).write([0, 0, 0, 0])
+  128.times { acc4 = T.blend(acc4, acc4, acc4, w, 1.0, [0, 0, 0, 0]) }
+  assert_true("128 dispatches with 32 bytes of push constants wait in one batch",
+              T.pending == 128, "pending = #{T.pending}")
+  acc4 = T.blend(acc4, acc4, acc4, w, 1.0, [0, 0, 0, 0])
+  assert_true("the 129th runs them first: a batch carries 4096 bytes of push constants",
+              T.pending == 1, "pending = #{T.pending}")
+  assert_true("and no dispatch is lost at that point", acc4.read == [129.0, 129.0, 129.0, 129.0],
+              acc4.read.inspect)
+  # The 8 bytes of axpy below, { n = 4, s = 1.0 }, are also how blend's 32 bytes start, and
+  # the rest of blend's block is zero. V3DV ignores a block that repeats what it holds, so the
+  # runtime pushes a block that grows twice (dispatch_pipeline). Without that, blend reads stale
+  # offsets here on V3DV.
+  s8 = B.floats(4).write([0, 0, 0, 0])
+  one4 = B.floats(4).write([1, 1, 1, 1])
+  3.times { s8 = T.axpy(s8, one4, 1.0) }                  # 8 bytes each
+  126.times { acc4 = T.blend(acc4, acc4, acc4, w, 1.0, [0, 0, 0, 0]) }
+  # Counted as V3DV places the blocks: 8 + 8 after the first, 126 * 32, and 32 more for the last.
+  assert_true("blocks of 8 bytes, then of 32: 3 and 126 of them fit in one batch",
+              T.pending == 129, "pending = #{T.pending}")
+  acc4 = T.blend(acc4, acc4, acc4, w, 1.0, [0, 0, 0, 0])
+  assert_true("and the next 32 bytes do not", T.pending == 1 && s8.read == [3.0, 3.0, 3.0, 3.0] &&
+              acc4.read == [256.0, 256.0, 256.0, 256.0], "#{T.pending} #{acc4.read.inspect}")
   assert_true("the three-buffer layout still works next to it",
               T.axpy(x, y, 2.0).read == [12.0, 24.0, 36.0, 48.0, 60.0])
 

@@ -138,6 +138,13 @@ GpuLayout *gpu_layout_get(uint32_t storage_buffers, uint32_t uniform_buffers,
     g_ctx.set_cap = (uint32_t)count;
   }
 
+  if (push_constant_size > g_ctx.push_scratch_cap) {
+    unsigned char *scratch = realloc(g_ctx.push_scratch, push_constant_size);
+    if (!scratch) return NULL;
+    g_ctx.push_scratch = scratch;
+    g_ctx.push_scratch_cap = push_constant_size;
+  }
+
   GpuLayout *l = calloc(1, sizeof(*l));
   VkDescriptorSetLayoutBinding *bindings = malloc((count ? count : 1) * sizeof(*bindings));
   if (!l || !bindings) {
@@ -362,6 +369,16 @@ void dispatch_pipeline(
   const uint32_t num_storage = layout->storage_buffers;
   const uint32_t num_buffers = num_storage + layout->uniform_buffers;
 
+  /* Keep the batch within its push-constant budget (GPU_BATCH_PUSH_BYTES).
+   * A flush here is one more early sync point. */
+  if (push_size > 0) {
+    uint32_t block = push_size > g_ctx.batch_push_max ? push_size : g_ctx.batch_push_max;
+    uint32_t first = g_ctx.batch_push_bytes ? g_ctx.batch_push_first : block;
+    /* Where this block would end, counted as in the comment at the macro. */
+    uint64_t end = (uint64_t)g_ctx.batch_push_bytes + block - first + block;
+    if (end > GPU_BATCH_PUSH_BYTES) gpu_flush(mrb);
+  }
+
   VkDescriptorSet desc_set = alloc_desc_set(mrb, layout);
 
   /* One write per binding: storage buffers first, then uniform buffers. The
@@ -389,10 +406,30 @@ void dispatch_pipeline(
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
     layout->pipe_layout, 0, 1, &desc_set, 0, NULL);
   if (push_size > 0) {
+    if (push_size > g_ctx.batch_push_max) {
+      /* The first block of this size in the batch is pushed twice: first
+       * with every bit inverted, then as it is. Mesa V3DV (25.2.8) ignores a
+       * vkCmdPushConstants whose bytes equal what it already holds, and
+       * forgets to note that the block grew. All zeroes at the start of a
+       * command buffer, or a block whose start repeats a smaller one and
+       * whose rest is zero, would then be only partly copied for a shader
+       * that indexes its push constants, which reads stale bytes instead.
+       * One of two blocks that differ in every byte cannot be ignored. */
+      const unsigned char *src = (const unsigned char *)push_data;
+      for (uint32_t i = 0; i < push_size; i++) g_ctx.push_scratch[i] = (unsigned char)~src[i];
+      vkCmdPushConstants(cmd, layout->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+        0, push_size, g_ctx.push_scratch);
+    }
     vkCmdPushConstants(cmd, layout->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
       0, push_size, push_data);
   }
   vkCmdDispatch(cmd, group_x, group_y, group_z);
+  if (push_size > 0) {
+    /* After a flush above, or in alloc_desc_set, both numbers are 0 again. */
+    if (push_size > g_ctx.batch_push_max) g_ctx.batch_push_max = push_size;
+    if (g_ctx.batch_push_bytes == 0) g_ctx.batch_push_first = g_ctx.batch_push_max;
+    g_ctx.batch_push_bytes += g_ctx.batch_push_max;
+  }
 
   /* Make this dispatch's writes visible to whatever is recorded next. One
    * global barrier per dispatch is coarser than tracking buffers one by one,
@@ -457,6 +494,9 @@ void gpu_flush(mrb_state *mrb) {
   /* No work is pending from here on (either it completed or it never left
    * the host), so the sets and the graveyard can go. */
   g_ctx.batch_dispatches = 0;
+  g_ctx.batch_push_bytes = 0;
+  g_ctx.batch_push_max = 0;
+  g_ctx.batch_push_first = 0;
   if (g_ctx.batch_sets > 0) {
     vkResetDescriptorPool(g_ctx.device, g_ctx.desc_pool, 0);
     g_ctx.batch_sets = 0;
@@ -630,6 +670,9 @@ void gpu_init(mrb_state *mrb) {
   g_ctx.batch_recording = 0;
   g_ctx.batch_dispatches = 0;
   g_ctx.batch_sets = 0;
+  g_ctx.batch_push_bytes = 0;
+  g_ctx.batch_push_max = 0;
+  g_ctx.batch_push_first = 0;
   g_ctx.epoch = 1;   /* a fresh buffer carries epoch 0, which never matches */
 
   /* Descriptor Pool. Layouts are created when pipelines ask for them
@@ -678,6 +721,9 @@ void gpu_shutdown(mrb_state *mrb) {
   g_ctx.set_infos = NULL;
   g_ctx.set_writes = NULL;
   g_ctx.set_cap = 0;
+  free(g_ctx.push_scratch);
+  g_ctx.push_scratch = NULL;
+  g_ctx.push_scratch_cap = 0;
   vkDestroyCommandPool(g_ctx.device, g_ctx.cmd_pool, NULL);
   vkDestroyDevice(g_ctx.device, NULL);
   vkDestroyInstance(g_ctx.instance, NULL);
