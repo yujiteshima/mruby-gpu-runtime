@@ -7,6 +7,7 @@
 #include <mruby/class.h>
 #include <mruby/hash.h>
 #include <mruby/string.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "axpy_spv.h"   /* c = a * s + b: 3 buffers, push { uint n; float s; } */
@@ -80,7 +81,27 @@ static mrb_value t_device_info(mrb_state *mrb, mrb_value self) {
   mrb_hash_set(mrb, h, mrb_symbol_value(mrb_intern_lit(mrb, "api")), api);
   mrb_hash_set(mrb, h, mrb_symbol_value(mrb_intern_lit(mrb, "max_workgroups")),
                mrb_fixnum_value((mrb_int)info.max_workgroups));
+  mrb_hash_set(mrb, h, mrb_symbol_value(mrb_intern_lit(mrb, "index")),
+               mrb_fixnum_value((mrb_int)info.index));
+  const char *type = "unknown";
+  switch (info.type) {
+    case GPU_RT_DEVICE_OTHER:      type = "other";      break;
+    case GPU_RT_DEVICE_INTEGRATED: type = "integrated"; break;
+    case GPU_RT_DEVICE_DISCRETE:   type = "discrete";   break;
+    case GPU_RT_DEVICE_VIRTUAL:    type = "virtual";    break;
+    case GPU_RT_DEVICE_CPU:        type = "cpu";        break;
+  }
+  mrb_hash_set(mrb, h, mrb_symbol_value(mrb_intern_lit(mrb, "type")),
+               mrb_symbol_value(mrb_intern_cstr(mrb, type)));
   return h;
+}
+
+/* GPURuntimeTest.device_env -> the value of MRUBY_GPU_DEVICE, or nil. mruby's
+ * default gems have no ENV, and the test needs to know whether the person
+ * running it chose a device. */
+static mrb_value t_device_env(mrb_state *mrb, mrb_value self) {
+  const char *v = getenv("MRUBY_GPU_DEVICE");
+  return (v && v[0]) ? mrb_str_new_cstr(mrb, v) : mrb_nil_value();
 }
 
 static mrb_value t_features(mrb_state *mrb, mrb_value self) {
@@ -321,6 +342,7 @@ void mrb_mruby_gpu_runtime_capi_test_gem_init(mrb_state *mrb) {
   mrb_define_module_function(mrb, t, "inc_and_release", t_inc_and_release, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, t, "inc_groups", t_inc_groups, MRB_ARGS_REQ(2));
   mrb_define_module_function(mrb, t, "create_pipeline", t_create_pipeline, MRB_ARGS_REQ(4));
+  mrb_define_module_function(mrb, t, "device_env", t_device_env, MRB_ARGS_NONE());
 
   struct RClass *buf = mrb_define_class_under(mrb, t, "Buffer", mrb->object_class);
   MRB_SET_INSTANCE_TT(buf, MRB_TT_CDATA);
