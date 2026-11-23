@@ -7,6 +7,7 @@
 #include "gpu_internal.h"
 #include <mruby/class.h>
 #include <mruby/data.h>
+#include <mruby/string.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -31,6 +32,18 @@ void gpu_rt_require_at(mrb_state *mrb, int major, int minor, const char *file) {
    * "Invalid mrb_state", so say it where it will be seen. */
   fprintf(stderr, "mruby-gpu-runtime: %s\n", msg);
   mrb_raise(mrb, E_RUNTIME_ERROR, msg);
+}
+
+/* ---- Errors ---- */
+
+/* Looked up by name each time rather than kept: the classes belong to one
+ * mrb_state, and this only runs on the way to a raise. */
+struct RClass *gpu_rt_error_class(mrb_state *mrb, gpu_rt_error_kind kind) {
+  static const char *const names[GPU_RT_ERROR_KIND_COUNT] = {
+    "Error", "DeviceError", "OutOfMemoryError", "UnsupportedError", "CompileError", "ShapeError"
+  };
+  if ((int)kind < 0 || kind >= GPU_RT_ERROR_KIND_COUNT) kind = GPU_RT_ERROR_GENERIC;
+  return mrb_class_get_under(mrb, mrb_module_get(mrb, "GPU"), names[kind]);
 }
 
 /* ---- Context ---- */
@@ -73,17 +86,59 @@ void gpu_rt_context_info(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_device_info
   out->api_minor = VK_VERSION_MINOR(props.apiVersion);
   out->api_patch = VK_VERSION_PATCH(props.apiVersion);
   out->max_workgroups = g_ctx.max_workgroups;
+  out->index = g_ctx.device_index;
+  switch (g_ctx.device_type) {
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: out->type = GPU_RT_DEVICE_INTEGRATED; break;
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   out->type = GPU_RT_DEVICE_DISCRETE;   break;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    out->type = GPU_RT_DEVICE_VIRTUAL;    break;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:            out->type = GPU_RT_DEVICE_CPU;        break;
+    default:                                     out->type = GPU_RT_DEVICE_OTHER;      break;
+  }
 }
 
 mrb_bool gpu_rt_context_has_feature(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_feature feature) {
   check_context(mrb, ctx, "gpu_rt_context_has_feature");
-  /* Nothing is detected or enabled at device creation yet (runtime#6), and a
-   * feature that is not enabled must not be used, so the answer is no. */
-  (void)feature;
-  return FALSE;
+  /* Filled in by gpu_init: detected, and turned on where that is needed. */
+  if ((int)feature < 0 || feature >= GPU_RT_FEATURE_COUNT) return FALSE;
+  return g_ctx.features[feature] ? TRUE : FALSE;
 }
 
 /* ---- Buffers ---- */
+
+static const struct { const char *name; size_t size; } dtypes[GPU_RT_DTYPE_COUNT] = {
+  [GPU_RT_DTYPE_FLOAT32] = { "float32", 4 },
+  [GPU_RT_DTYPE_UINT8]   = { "uint8",   1 },
+  [GPU_RT_DTYPE_UINT16]  = { "uint16",  2 },
+  [GPU_RT_DTYPE_INT32]   = { "int32",   4 },
+};
+
+size_t gpu_rt_dtype_size(mrb_state *mrb, gpu_rt_dtype dtype) {
+  (void)mrb;
+  return (unsigned)dtype < GPU_RT_DTYPE_COUNT ? dtypes[dtype].size : 0;
+}
+
+const char *gpu_rt_dtype_name(mrb_state *mrb, gpu_rt_dtype dtype) {
+  (void)mrb;
+  return (unsigned)dtype < GPU_RT_DTYPE_COUNT ? dtypes[dtype].name : "unknown";
+}
+
+/* For messages: mrb_raisef has no format for a size_t, and an mrb_int may be
+ * too narrow for one. The strings are mruby's and die with the exception. */
+static const char *size_string(mrb_state *mrb, size_t n) {
+  char s[24];
+  snprintf(s, sizeof(s), "%llu", (unsigned long long)n);
+  return mrb_str_to_cstr(mrb, mrb_str_new_cstr(mrb, s));
+}
+
+static const char *shape_string(mrb_state *mrb, uint32_t ndim, const uint32_t *shape) {
+  char s[16 * GPU_RT_MAX_DIMS];
+  int at = snprintf(s, sizeof(s), "[");
+  for (uint32_t i = 0; i < ndim; i++) {
+    at += snprintf(s + at, sizeof(s) - (size_t)at, i ? ", %u" : "%u", (unsigned)shape[i]);
+  }
+  snprintf(s + at, sizeof(s) - (size_t)at, "]");
+  return mrb_str_to_cstr(mrb, mrb_str_new_cstr(mrb, s));
+}
 
 gpu_rt_buffer *gpu_rt_buffer_create(mrb_state *mrb, gpu_rt_context *ctx,
                                     const gpu_rt_buffer_desc *desc) {
@@ -95,7 +150,64 @@ gpu_rt_buffer *gpu_rt_buffer_create(mrb_state *mrb, gpu_rt_context *ctx,
       "gpu_rt_buffer_create: usage %d is not a combination of GPU_RT_BUFFER_ bits",
       (int)desc->usage);
   }
-  return gpu_buffer_create_bytes(mrb, (VkDeviceSize)desc->size, desc->usage);
+  size_t elem = gpu_rt_dtype_size(mrb, desc->dtype);
+  if (elem == 0) {
+    mrb_raisef(mrb, E_ARGUMENT_ERROR, "gpu_rt_buffer_create: %d is not a dtype",
+               (int)desc->dtype);
+  }
+  const char *dtype = gpu_rt_dtype_name(mrb, desc->dtype);
+  if (desc->ndim > GPU_RT_MAX_DIMS) {
+    mrb_raisef(mrb, E_ARGUMENT_ERROR,
+      "gpu_rt_buffer_create: %d dimensions, and a buffer has at most %d",
+      (int)desc->ndim, GPU_RT_MAX_DIMS);
+  }
+
+  size_t size = desc->size, count;
+  uint32_t ndim = desc->ndim, shape[GPU_RT_MAX_DIMS] = { 0 };
+  if (ndim == 0) {
+    /* One dimension, as long as the bytes allow. */
+    count = size / elem;
+    if (size % elem != 0) {
+      mrb_raisef(mrb, E_ARGUMENT_ERROR,
+        "gpu_rt_buffer_create: %s bytes is not a whole number of %s elements (%d bytes each)",
+        size_string(mrb, size), dtype, (int)elem);
+    }
+    if (count > UINT32_MAX) {
+      mrb_raisef(mrb, E_ARGUMENT_ERROR,
+        "gpu_rt_buffer_create: %s %s elements, and one dimension holds at most 4294967295",
+        size_string(mrb, count), dtype);
+    }
+    ndim = 1;
+    shape[0] = (uint32_t)count;
+  } else {
+    count = 1;
+    for (uint32_t i = 0; i < ndim; i++) shape[i] = desc->shape[i];
+    /* A zero extent makes the product 0 whatever the others are, so look for
+     * one first: the overflow check below then only sees real products. */
+    for (uint32_t i = 0; i < ndim; i++) if (shape[i] == 0) count = 0;
+    for (uint32_t i = 0; count != 0 && i < ndim; i++) {
+      if (count > SIZE_MAX / elem / shape[i]) {
+        mrb_raisef(mrb, E_ARGUMENT_ERROR,
+          "gpu_rt_buffer_create: a %s buffer of shape %s is more bytes than a size_t holds",
+          dtype, shape_string(mrb, ndim, shape));
+      }
+      count *= shape[i];
+    }
+    if (size != 0 && size != count * elem) {
+      mrb_raisef(mrb, E_ARGUMENT_ERROR,
+        "gpu_rt_buffer_create: size is %s bytes, but shape %s of %s is %s bytes",
+        size_string(mrb, size), shape_string(mrb, ndim, shape), dtype,
+        size_string(mrb, count * elem));
+    }
+    size = count * elem;
+  }
+
+  GpuBuffer *buf = gpu_buffer_create_bytes(mrb, (VkDeviceSize)size, desc->usage);
+  buf->dtype = desc->dtype;
+  buf->ndim = ndim;
+  buf->count = count;
+  memcpy(buf->shape, shape, sizeof(shape));
+  return buf;
 }
 
 mrb_value gpu_rt_buffer_wrap(mrb_state *mrb, struct RClass *klass, gpu_rt_buffer *buf) {
@@ -126,6 +238,27 @@ gpu_rt_buffer *gpu_rt_buffer_get(mrb_state *mrb, mrb_value obj) {
 size_t gpu_rt_buffer_size(mrb_state *mrb, gpu_rt_buffer *buf) {
   (void)mrb;
   return (size_t)buf->size;
+}
+
+gpu_rt_dtype gpu_rt_buffer_dtype(mrb_state *mrb, gpu_rt_buffer *buf) {
+  (void)mrb;
+  return buf->dtype;
+}
+
+uint32_t gpu_rt_buffer_ndim(mrb_state *mrb, gpu_rt_buffer *buf) {
+  (void)mrb;
+  return buf->ndim;
+}
+
+void gpu_rt_buffer_shape(mrb_state *mrb, gpu_rt_buffer *buf,
+                         uint32_t shape_out[GPU_RT_MAX_DIMS]) {
+  (void)mrb;
+  memcpy(shape_out, buf->shape, sizeof(buf->shape));
+}
+
+size_t gpu_rt_buffer_count(mrb_state *mrb, gpu_rt_buffer *buf) {
+  (void)mrb;
+  return buf->count;
 }
 
 void *gpu_rt_buffer_map(mrb_state *mrb, gpu_rt_buffer *buf) {
@@ -221,13 +354,19 @@ static uint64_t hash_bytes(uint64_t h, const void *data, size_t size) {
 static gpu_rt_pipeline *pipeline_failed(mrb_state *mrb, const char *label,
                                         const char *operation, const char *reason,
                                         VkResult r, gpu_rt_error *error_out) {
+  /* A shader the device does not take is a compile error, whatever result
+   * the driver chose for it; memory and the device keep their own classes. */
+  gpu_rt_error_kind kind = gpu_result_kind(r);
+  if (kind == GPU_RT_ERROR_GENERIC) kind = GPU_RT_ERROR_COMPILE;
   if (error_out) {
     error_out->operation = operation;
     error_out->reason = reason;
     error_out->vk_result = (int32_t)r;
+    error_out->kind = kind;
     return NULL;
   }
-  mrb_raisef(mrb, E_RUNTIME_ERROR, "gpu_rt_pipeline_create(%s): %s failed: %s (VkResult %d)",
+  mrb_raisef(mrb, gpu_rt_error_class(mrb, kind),
+             "gpu_rt_pipeline_create(%s): %s failed: %s (VkResult %d)",
              label, operation, reason, (int)r);
   return NULL;   /* not reached */
 }
@@ -407,7 +546,7 @@ void gpu_rt_dispatch(mrb_state *mrb, const gpu_rt_dispatch_desc *d) {
   const char *label = d->label ? d->label : (p->label ? p->label : "unnamed");
 
   if (e->pipeline == VK_NULL_HANDLE || !g_ctx.initialized) {
-    mrb_raisef(mrb, E_RUNTIME_ERROR,
+    mrb_raisef(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_GENERIC),
       "gpu_rt_dispatch(%s): the pipeline was released, or the device is gone", label);
   }
   const GpuLayout *l = e->layout;
@@ -441,7 +580,8 @@ void gpu_rt_dispatch(mrb_state *mrb, const gpu_rt_dispatch_desc *d) {
                     d->push_constants, d->push_constant_size,
                     d->groups[0],
                     d->groups[1] ? d->groups[1] : 1,
-                    d->groups[2] ? d->groups[2] : 1);
+                    d->groups[2] ? d->groups[2] : 1,
+                    label);
   /* Marked after the call: the core may flush inside it (an empty descriptor
    * pool before recording, :eager mode after), and what matters to a later
    * release is whether the batch being recorded now binds this pipeline. */

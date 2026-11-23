@@ -12,10 +12,11 @@ The Vulkan core of mruby-gpu-narray now lives here: device and queue setup, buff
 - A pipeline's layout is described by value: the number of storage buffers, the number of uniform buffers and the size of the push constants, up to what the device allows (`gpu_rt_context_limits`).
 - Pipelines are cached. The same SPIR-V with the same layout is compiled once, however many times it is asked for.
 - Each buffer has a `VkDeviceMemory` of its own; there is no memory pool yet.
+- The device can be chosen, and `GPU.info[:features]` says what it can do; see [Devices and features](#devices-and-features).
 
 ## What it will provide
 
-- Device selection and feature reporting (`GPU.info`)
+- Device selection and feature reporting (`GPU.info`): done, see [Devices and features](#devices-and-features)
 - Buffers that carry a dtype and a shape, and a batch that records dispatches and submits them once
 - Pipelines created from SPIR-V, with the shaders embedded in the binary
 - A C API with a single header for gem authors (`include/gpu_runtime.h`)
@@ -25,6 +26,53 @@ The Vulkan core of mruby-gpu-narray now lives here: device and queue setup, buff
 [mruby-gpu-narray](https://github.com/yujiteshima/mruby-gpu-narray) and [mruby-gpu-kernel](https://github.com/yujiteshima/mruby-gpu-kernel) will be rebuilt on top of it. Like them, it links only against the Vulkan loader.
 
 Progress is tracked in the [GitHub Project](https://github.com/users/yujiteshima/projects/3).
+
+## Devices and features
+
+A machine can have several Vulkan devices. A Raspberry Pi 5 has two, the V3D GPU and llvmpipe, which runs on the CPU.
+
+```ruby
+GPU.devices
+# => [{index: 0, name: "V3D 7.1.10.2", type: :integrated},
+#     {index: 1, name: "llvmpipe (LLVM 20.1.2, 128 bits)", type: :cpu}]
+
+GPU.device = 1            # by index
+GPU.device = "llvmpipe"   # or by name
+GPU.device = nil          # the default again
+```
+
+The device starts at the first GPU operation, and it is chosen then, by the first of these that says something:
+
+1. `GPU.device = index_or_name`, called before the first GPU operation.
+2. The environment variable `MRUBY_GPU_DEVICE`, an index or a name. A script that makes no choice then runs unchanged on another device: `MRUBY_GPU_DEVICE=llvmpipe mruby script.rb`.
+3. The first device that is not a CPU, or device 0 when every device is one.
+
+- An index is the position in `GPU.devices`, which is the order Vulkan lists the devices in. That order can differ between machines and drivers; a name does not depend on it.
+- A name matches the device whose name is equal to it, ignoring case. If there is none, it matches a device whose name contains it, so `"V3D"` finds `"V3D 7.1.10.2"` whatever the driver version. When several devices match, the one with the lowest index is used.
+- `type` is `:integrated`, `:discrete`, `:virtual`, `:cpu` (a software rasterizer such as llvmpipe or lavapipe) or `:other`.
+- `GPU.devices` and `GPU.device=` do not start the device.
+- When no device matches, `GPU.device=` raises `ArgumentError`, and a `MRUBY_GPU_DEVICE` that matches nothing raises `GPU::DeviceError` when the device starts. Both messages list the devices.
+- Once the device has started it cannot change, because the buffers and pipelines of every GPU gem live on it. `GPU.device=` then accepts only the device in use, and raises `GPU::Error` for another one.
+
+`GPU.info` describes the device in use:
+
+```ruby
+GPU.info
+# => {device: "V3D 7.1.10.2", api_version: "1.3.305", backend: "Vulkan", max_workgroups: 65535,
+#     device_index: 0, device_type: :integrated,
+#     features: {storage_8bit: true, timestamp_query: true, subgroups: true, memory_budget: false}}
+```
+
+The values above are an example. `GPU.info[:features]` always has these four keys, and each value is `true` or `false`. The keys are stable: code may rely on them.
+
+| Key | `true` when | C API |
+|---|---|---|
+| `:storage_8bit` | The device has `VK_KHR_8bit_storage` with `storageBuffer8BitAccess`: a shader may declare 8-bit integers in a storage buffer. | `GPU_RT_FEATURE_STORAGE_8BIT` |
+| `:timestamp_query` | The compute queue writes timestamps (`timestampValidBits` is not 0, and `timestampPeriod` is positive). | `GPU_RT_FEATURE_TIMESTAMP_QUERY` |
+| `:subgroups` | Compute shaders may use subgroup operations, at least the basic ones (`VkPhysicalDeviceSubgroupProperties`). | `GPU_RT_FEATURE_SUBGROUPS` |
+| `:memory_budget` | The device has `VK_EXT_memory_budget`. | `GPU_RT_FEATURE_MEMORY_BUDGET` |
+
+`true` means that the device has the feature and that the runtime has turned it on, so it can be used. The runtime turns on 8-bit storage and the memory-budget extension whenever the device has them; the other two need nothing turned on. A gem asks with `gpu_rt_context_has_feature`, which gives the same answers.
 
 ## Depending on it
 
@@ -46,17 +94,20 @@ A GPU gem includes one header, `<gpu_runtime.h>`, and never calls Vulkan itself.
 |---|---|
 | Version | `GPU_RT_API_VERSION`, `gpu_rt_require(mrb, major, minor)` |
 | Context (`gpu_rt_context`) | `gpu_rt_context_get`, `gpu_rt_context_ready`, `gpu_rt_context_info`, `gpu_rt_context_has_feature`, `gpu_rt_context_limits` |
-| Buffers (`gpu_rt_buffer`) | `gpu_rt_buffer_create`, `gpu_rt_buffer_wrap`, `gpu_rt_buffer_release`, `gpu_rt_buffer_get`, `gpu_rt_buffer_check`, `gpu_rt_buffer_size`, `gpu_rt_buffer_map`, `gpu_rt_buffer_unmap` |
+| Buffers (`gpu_rt_buffer`) | `gpu_rt_buffer_create`, `gpu_rt_buffer_wrap`, `gpu_rt_buffer_release`, `gpu_rt_buffer_get`, `gpu_rt_buffer_check`, `gpu_rt_buffer_size`, `gpu_rt_buffer_map`, `gpu_rt_buffer_unmap`, `gpu_rt_buffer_dtype`, `gpu_rt_buffer_ndim`, `gpu_rt_buffer_shape`, `gpu_rt_buffer_count`, `gpu_rt_dtype_size`, `gpu_rt_dtype_name` |
 | Pipelines (`gpu_rt_pipeline`) | `gpu_rt_pipeline_create`, `gpu_rt_pipeline_release`, `gpu_rt_pipeline_count` |
 | Dispatch | `gpu_rt_dispatch` |
 | Sync | `gpu_rt_sync`, `gpu_rt_buffer_sync`, `gpu_rt_pending` |
+| Errors | `gpu_rt_error_kind`, `gpu_rt_error_class` |
 
-- `gpu_rt_context_get(mrb)` starts Vulkan the first time it is called, so a program that never uses the GPU never pays for it.
+- `gpu_rt_context_get(mrb)` starts Vulkan the first time it is called, so a program that never uses the GPU never pays for it. The device is chosen there, as [Devices and features](#devices-and-features) describes; a gem does not choose it.
+- `gpu_rt_context_info` fills a `gpu_rt_device_info` with what `GPU.info` reports, including the device's index and its `gpu_rt_device_type`. `gpu_rt_context_has_feature` answers for one `gpu_rt_feature`.
 - A buffer is created with a size in bytes and a usage, and wrapped as a Ruby object at once, so that the GC frees it. `gpu_rt_buffer_get` reads the buffer of a `GPU::NArray` that Ruby passes in.
+- A buffer records a dtype (`float32`, `uint8`, `uint16` or `int32`) and a shape of up to `GPU_RT_MAX_DIMS` (4) dimensions. A description that names neither is one-dimensional float32, with the element count taken from the size. A description with a shape needs no size. A size that disagrees with the shape, or is not a whole number of elements, raises `ArgumentError`. The runtime does not convert or check elements; the gem reads the dtype and shape of a buffer and decides what to do.
 - A pipeline is created from SPIR-V bytes and a layout described by value: `{ .storage_buffers = 2, .push_constant_size = 4 }`, or with `.uniform_buffers = 1` for a shader that also reads a uniform buffer. The storage buffers take bindings 0, 1, ... of set 0 and the uniform buffers the bindings after them. The runtime does not read the SPIR-V, so the description has to match the shader.
 - Creating a pipeline that already exists, with the same SPIR-V and the same layout, returns another handle to it and compiles nothing. Each handle is released once.
 - `gpu_rt_dispatch` records a dispatch, with a label that names the operation, into the batch that all GPU gems share. Nothing runs until a result is needed: `gpu_rt_buffer_map` waits for the dispatches that touch that buffer, and `gpu_rt_sync` for all of them.
-- Every function takes `mrb` first and raises a Ruby exception when it fails.
+- Every function takes `mrb` first and raises a Ruby exception when it fails: `GPU::Error` or a subclass for a failure of the device, the driver or a shader, and `ArgumentError` or `TypeError` for a mistake in the call. See [Errors](#errors).
 - `gpu_rt_require(mrb, 0, 1)` in the gem's init function stops the gem with a message that names both versions when the runtime provides another API version.
 
 In `mrbgem.rake` the gem needs only the dependency. The include path and the Vulkan loader come with it:
@@ -66,6 +117,52 @@ spec.add_dependency 'mruby-gpu-runtime', github: 'yujiteshima/mruby-gpu-runtime'
 ```
 
 [`test/capi`](test/capi) is a small gem written this way, with its shaders embedded as SPIR-V.
+
+## Errors
+
+The runtime defines the exception classes of every GPU gem:
+
+```
+StandardError
+├── GPU::Error                 anything the GPU side does wrong
+│   ├── GPU::DeviceError       no usable device, initialisation failed, device lost
+│   ├── GPU::OutOfMemoryError  host or device memory, or another resource, ran out
+│   ├── GPU::UnsupportedError  the device lacks an extension, a feature or a format
+│   └── GPU::CompileError      a shader could not be made into a pipeline
+└── ArgumentError
+    └── GPU::ShapeError        arrays whose sizes or shapes do not fit the operation
+```
+
+```ruby
+begin
+  result = (a + b).to_a
+rescue GPU::OutOfMemoryError
+  # free some arrays and try again
+rescue GPU::Error => e
+  # the device, the driver or a shader failed
+end
+```
+
+- `rescue GPU::Error` catches every failure of the device, the driver or a shader. They were `RuntimeError` before, so `rescue RuntimeError` no longer catches them; `rescue StandardError` and a bare `rescue` still do.
+- A mistake in the call stays an `ArgumentError` or a `TypeError`, and is not a `GPU::Error`. `GPU::ShapeError` is the `ArgumentError` for arrays that do not fit each other or the operation, so code that rescues `ArgumentError` keeps working.
+- A message names the operation, the Vulkan call and the `VkResult`, for example `creating a buffer of 1125899906842624 bytes: vkAllocateMemory failed: out of device memory (VkResult -2)`. The message of a failed dispatch starts with the dispatch's label, and a dispatch that does not fit its pipeline names the binding.
+
+The class of a failed Vulkan call comes from its `VkResult`:
+
+| `VkResult` | Class |
+|---|---|
+| `VK_ERROR_OUT_OF_HOST_MEMORY` (-1), `VK_ERROR_OUT_OF_DEVICE_MEMORY` (-2), `VK_ERROR_MEMORY_MAP_FAILED` (-5), `VK_ERROR_TOO_MANY_OBJECTS` (-10), `VK_ERROR_FRAGMENTED_POOL` (-12), `VK_ERROR_OUT_OF_POOL_MEMORY` (-1000069000), `VK_ERROR_FRAGMENTATION` (-1000161000) | `GPU::OutOfMemoryError` |
+| `VK_ERROR_INITIALIZATION_FAILED` (-3), `VK_ERROR_DEVICE_LOST` (-4), `VK_ERROR_INCOMPATIBLE_DRIVER` (-9) | `GPU::DeviceError` |
+| `VK_ERROR_LAYER_NOT_PRESENT` (-6), `VK_ERROR_EXTENSION_NOT_PRESENT` (-7), `VK_ERROR_FEATURE_NOT_PRESENT` (-8), `VK_ERROR_FORMAT_NOT_SUPPORTED` (-11) | `GPU::UnsupportedError` |
+| `VK_ERROR_INVALID_SHADER_NV` (-1000012000) | `GPU::CompileError` |
+| any other | `GPU::Error`; but `GPU::DeviceError` while the device is being started, and `GPU::CompileError` from `gpu_rt_pipeline_create` |
+
+A gem raises the same classes through the C API. `gpu_rt_error_class(mrb, kind)` returns the class of a `gpu_rt_error_kind`, and the `gpu_rt_error` that `gpu_rt_pipeline_create` fills in carries the kind:
+
+```c
+mrb_raisef(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_SHAPE),
+           "shape mismatch: %d vs %d", (int)n, (int)m);
+```
 
 ## Build and test
 

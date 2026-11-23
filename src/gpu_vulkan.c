@@ -7,6 +7,8 @@
  * use it.
  */
 #include "gpu_internal.h"
+#include <mruby/error.h>
+#include <mruby/string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,14 +38,68 @@ const char *gpu_result_name(VkResult r) {
     case VK_ERROR_TOO_MANY_OBJECTS:       return "too many objects";
     case VK_ERROR_FRAGMENTED_POOL:        return "descriptor pool fragmented";
     case VK_ERROR_UNKNOWN:                return "unknown error";
-    default:                              return "unrecognised VkResult";
+    default: break;
   }
+  /* Results newer than Vulkan 1.0, by value: an older SDK header may not
+   * name them, and a newer driver may still return them. */
+  switch ((int)r) {
+    case -11:         return "format not supported";      /* VK_ERROR_FORMAT_NOT_SUPPORTED */
+    case -1000012000: return "invalid shader";            /* VK_ERROR_INVALID_SHADER_NV */
+    case -1000069000: return "out of pool memory";        /* VK_ERROR_OUT_OF_POOL_MEMORY */
+    case -1000161000: return "fragmentation";             /* VK_ERROR_FRAGMENTATION */
+    default:          return "unrecognised VkResult";
+  }
+}
+
+/* Which exception class a VkResult stands for. Listed by value for the same
+ * reason as above. Anything not listed is GPU::Error itself, unless the
+ * caller knows more (gpu_fail during initialisation, gpu_rt_pipeline_create). */
+gpu_rt_error_kind gpu_result_kind(VkResult r) {
+  switch ((int)r) {
+    case -1:          /* VK_ERROR_OUT_OF_HOST_MEMORY */
+    case -2:          /* VK_ERROR_OUT_OF_DEVICE_MEMORY */
+    case -5:          /* VK_ERROR_MEMORY_MAP_FAILED: no address space left to map into */
+    case -10:         /* VK_ERROR_TOO_MANY_OBJECTS: e.g. more allocations than the device allows */
+    case -12:         /* VK_ERROR_FRAGMENTED_POOL */
+    case -1000069000: /* VK_ERROR_OUT_OF_POOL_MEMORY */
+    case -1000161000: /* VK_ERROR_FRAGMENTATION */
+      return GPU_RT_ERROR_OUT_OF_MEMORY;
+    case -3:          /* VK_ERROR_INITIALIZATION_FAILED */
+    case -4:          /* VK_ERROR_DEVICE_LOST */
+    case -9:          /* VK_ERROR_INCOMPATIBLE_DRIVER: no driver for the Vulkan asked for */
+      return GPU_RT_ERROR_DEVICE;
+    case -6:          /* VK_ERROR_LAYER_NOT_PRESENT */
+    case -7:          /* VK_ERROR_EXTENSION_NOT_PRESENT */
+    case -8:          /* VK_ERROR_FEATURE_NOT_PRESENT */
+    case -11:         /* VK_ERROR_FORMAT_NOT_SUPPORTED */
+      return GPU_RT_ERROR_UNSUPPORTED;
+    case -1000012000: /* VK_ERROR_INVALID_SHADER_NV */
+      return GPU_RT_ERROR_COMPILE;
+    default:
+      return GPU_RT_ERROR_GENERIC;
+  }
+}
+
+void gpu_fail(mrb_state *mrb, VkResult r, const char *call, const char *operation) {
+  gpu_rt_error_kind kind = gpu_result_kind(r);
+  /* Before the context is ready the callers are gpu_init and the listing of
+   * devices (GPU.devices, GPU.device=), and whatever stops them leaves the
+   * process without a device. */
+  if (!g_ctx.initialized) {
+    if (kind == GPU_RT_ERROR_GENERIC) kind = GPU_RT_ERROR_DEVICE;
+    if (!operation) operation = "starting the GPU";
+  }
+  struct RClass *c = gpu_rt_error_class(mrb, kind);
+  if (operation) {
+    mrb_raisef(mrb, c, "%s: %s failed: %s (VkResult %d)",
+               operation, call, gpu_result_name(r), (int)r);
+  }
+  mrb_raisef(mrb, c, "%s failed: %s (VkResult %d)", call, gpu_result_name(r), (int)r);
 }
 
 void gpu_check(mrb_state *mrb, VkResult r, const char *call) {
   if (r == VK_SUCCESS) return;
-  mrb_raisef(mrb, E_RUNTIME_ERROR, "%s failed: %s (VkResult %d)",
-             call, gpu_result_name(r), (int)r);
+  gpu_fail(mrb, r, call, NULL);
 }
 
 /* Portability (MoltenVK on macOS) support. Absent on the Raspberry Pi's native
@@ -270,7 +326,7 @@ VkResult gpu_create_pipeline(const uint32_t *code, size_t size, const GpuLayout 
  * how map_buffer knows whether a flush is due, and how the GC finalizer knows
  * a buffer must outlive its Ruby owner until the batch has run. */
 
-static void batch_begin(mrb_state *mrb) {
+static void batch_begin(mrb_state *mrb, const char *op) {
   if (g_ctx.batch_recording) return;
   VkCommandBufferBeginInfo begin = {
     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -278,7 +334,8 @@ static void batch_begin(mrb_state *mrb) {
   };
   /* The pool was created with RESET_COMMAND_BUFFER_BIT, so beginning a
    * command buffer that has already been submitted resets it implicitly. */
-  VK_CHECK(mrb, vkBeginCommandBuffer(g_ctx.batch_cmd, &begin));
+  VkResult r = vkBeginCommandBuffer(g_ctx.batch_cmd, &begin);
+  if (r != VK_SUCCESS) gpu_fail(mrb, r, "vkBeginCommandBuffer", op);
   g_ctx.batch_recording = 1;
 }
 
@@ -303,12 +360,12 @@ static VkResult create_desc_pool(uint32_t storage, uint32_t uniform, VkDescripto
  * flushed a little early: the sets it held are released by the reset. A pool
  * that is too small for the layouts created since it was made is replaced
  * first, which also needs the batch to have run. */
-static VkDescriptorSet alloc_desc_set(mrb_state *mrb, const GpuLayout *layout) {
+static VkDescriptorSet alloc_desc_set(mrb_state *mrb, const GpuLayout *layout, const char *op) {
   if (g_ctx.pool_storage < g_ctx.want_storage || g_ctx.pool_uniform < g_ctx.want_uniform) {
     gpu_flush(mrb);   /* the recorded dispatches use sets of the old pool */
     VkDescriptorPool pool = VK_NULL_HANDLE;
-    gpu_check(mrb, create_desc_pool(g_ctx.want_storage, g_ctx.want_uniform, &pool),
-              "vkCreateDescriptorPool");
+    VkResult pr = create_desc_pool(g_ctx.want_storage, g_ctx.want_uniform, &pool);
+    if (pr != VK_SUCCESS) gpu_fail(mrb, pr, "vkCreateDescriptorPool", op);
     vkDestroyDescriptorPool(g_ctx.device, g_ctx.desc_pool, NULL);
     g_ctx.desc_pool = pool;
     g_ctx.pool_storage = g_ctx.want_storage;
@@ -336,7 +393,7 @@ static VkDescriptorSet alloc_desc_set(mrb_state *mrb, const GpuLayout *layout) {
     gpu_flush(mrb);
     r = vkAllocateDescriptorSets(g_ctx.device, &dsai, &set);
   }
-  gpu_check(mrb, r, "vkAllocateDescriptorSets");
+  if (r != VK_SUCCESS) gpu_fail(mrb, r, "vkAllocateDescriptorSets", op);
   g_ctx.batch_sets++;
   g_ctx.batch_storage += layout->storage_buffers;
   g_ctx.batch_uniform += layout->uniform_buffers;
@@ -347,7 +404,8 @@ void dispatch_pipeline(
     mrb_state *mrb, VkPipeline pipeline, const GpuLayout *layout,
     GpuBuffer **bufs, GpuBuffer **uniforms,
     const void *push_data, uint32_t push_size,
-    uint32_t group_x, uint32_t group_y, uint32_t group_z)
+    uint32_t group_x, uint32_t group_y, uint32_t group_z,
+    const char *label)
 {
   /* Exceeding maxComputeWorkGroupCount is invalid usage, and what happens is
    * up to the driver: lavapipe runs the dispatch anyway and returns the right
@@ -364,7 +422,7 @@ void dispatch_pipeline(
       (mrb_int)g_ctx.max_workgroups * 256);
   }
   if (pipeline == VK_NULL_HANDLE) {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "dispatch of a pipeline that was never created");
+    GPU_RAISE(mrb, GPU_RT_ERROR_GENERIC, "dispatch of a pipeline that was never created");
   }
   const uint32_t num_storage = layout->storage_buffers;
   const uint32_t num_buffers = num_storage + layout->uniform_buffers;
@@ -379,7 +437,12 @@ void dispatch_pipeline(
     if (end > GPU_BATCH_PUSH_BYTES) gpu_flush(mrb);
   }
 
-  VkDescriptorSet desc_set = alloc_desc_set(mrb, layout);
+  /* What a Vulkan failure below is reported under: the same prefix as the
+   * checks in gpu_rt_dispatch. */
+  char op[96];
+  snprintf(op, sizeof(op), "gpu_rt_dispatch(%s)", label ? label : "unnamed");
+
+  VkDescriptorSet desc_set = alloc_desc_set(mrb, layout, op);
 
   /* One write per binding: storage buffers first, then uniform buffers. The
    * arrays are as wide as the widest layout (gpu_layout_get). */
@@ -400,7 +463,7 @@ void dispatch_pipeline(
   }
   vkUpdateDescriptorSets(g_ctx.device, num_buffers, writes, 0, NULL);
 
-  batch_begin(mrb);
+  batch_begin(mrb, op);
   VkCommandBuffer cmd = g_ctx.batch_cmd;
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -507,26 +570,38 @@ void gpu_flush(mrb_state *mrb) {
   bury_graveyard(mrb);
   gpu_pipelines_sweep(mrb);
 
-  if (step) gpu_check(mrb, r, step);
+  if (step && r != VK_SUCCESS) gpu_fail(mrb, r, step, "running the batch");
 }
 
 void gpu_sync_buffer(mrb_state *mrb, GpuBuffer *buf) {
   if (g_ctx.batch_recording && buf->epoch == g_ctx.epoch) gpu_flush(mrb);
 }
 
-/* ---- Init ---- */
-void gpu_init(mrb_state *mrb) {
-  if (g_ctx.initialized) return;
-  /* A half-built context cannot be reused, and retrying would leak everything
-   * the failed attempt created -- once per operation, since initialization is
-   * lazy. One attempt per process; fix the environment and restart. */
-  if (g_ctx.init_failed) {
-    mrb_raise(mrb, E_RUNTIME_ERROR,
-      "GPU initialization already failed in this process and is not retried");
-  }
-  g_ctx.init_failed = 1;   /* cleared only on the success path at the end */
+/* ---- Devices ----
+ *
+ * Which physical device the context runs on is decided once, when the device
+ * starts (gpu_init), from the first of these that says something:
+ *
+ *   1. GPU.device = index or name, called before the first GPU operation;
+ *   2. the environment variable MRUBY_GPU_DEVICE, an index or a name, so a
+ *      script that makes no choice runs unchanged on another device;
+ *   3. the first device that is not a CPU (a software rasterizer such as
+ *      llvmpipe), or device 0 when every device is one.
+ *
+ * An index is the position in vkEnumeratePhysicalDevices' answer, which is
+ * also the order of GPU.devices. A name matches a device whose name is equal
+ * to it, ignoring case, and otherwise a device whose name contains it; with
+ * several matches the lowest index wins. Listing and choosing need only the
+ * instance, so neither starts the device.
+ *
+ * Once the device has started it cannot change: buffers and pipelines of
+ * every GPU gem live on it. Choosing the device already in use is accepted,
+ * and anything else raises. */
 
-  /* Instance */
+#define GPU_DEVICE_ENV "MRUBY_GPU_DEVICE"
+
+static void instance_ensure(mrb_state *mrb) {
+  if (g_ctx.instance_ready) return;
   VkApplicationInfo app_info = {
     .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
     .pApplicationName = "mruby-gpu-runtime",
@@ -548,34 +623,228 @@ void gpu_init(mrb_state *mrb) {
     .enabledExtensionCount = inst_ext_count,
     .ppEnabledExtensionNames = inst_ext_count ? inst_exts : NULL
   };
-  VK_CHECK(mrb, vkCreateInstance(&inst_info, NULL, &g_ctx.instance));
+  VkResult r = vkCreateInstance(&inst_info, NULL, &g_ctx.instance);
+  if (r != VK_SUCCESS) gpu_fail(mrb, r, "vkCreateInstance", "starting Vulkan");
+  g_ctx.instance_ready = 1;
+}
 
-  /* Physical Device: prefer a real GPU over a software rasterizer.
-   * The Pi exposes both V3D (hardware) and llvmpipe (CPU); pick the first
-   * non-CPU device so compute actually runs on the GPU. Falls back to the
-   * first device if every device is CPU-type. */
+/* The instance's physical devices, in a malloc'ed array the caller frees. */
+static VkPhysicalDevice *physical_devices(mrb_state *mrb, uint32_t *count) {
+  instance_ensure(mrb);
   uint32_t dev_count = 0;
-  VK_CHECK(mrb, vkEnumeratePhysicalDevices(g_ctx.instance, &dev_count, NULL));
+  VkResult count_r = vkEnumeratePhysicalDevices(g_ctx.instance, &dev_count, NULL);
+  if (count_r != VK_SUCCESS) {
+    gpu_fail(mrb, count_r, "vkEnumeratePhysicalDevices", "listing the Vulkan devices");
+  }
   if (dev_count == 0) {
-    mrb_raise(mrb, E_RUNTIME_ERROR,
+    GPU_RAISE(mrb, GPU_RT_ERROR_DEVICE,
       "no Vulkan physical device found (is a Vulkan driver installed?)");
   }
   VkPhysicalDevice *devs = malloc(sizeof(VkPhysicalDevice) * dev_count);
-  if (!devs) mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory enumerating devices");
+  if (!devs) GPU_RAISE(mrb, GPU_RT_ERROR_OUT_OF_MEMORY, "out of memory enumerating devices");
   VkResult dev_r = vkEnumeratePhysicalDevices(g_ctx.instance, &dev_count, devs);
-  if (dev_r != VK_SUCCESS) {
+  /* VK_INCOMPLETE means a device appeared between the two calls; the ones
+   * returned are valid. */
+  if ((dev_r != VK_SUCCESS && dev_r != VK_INCOMPLETE) || dev_count == 0) {
     free(devs);
-    gpu_check(mrb, dev_r, "vkEnumeratePhysicalDevices");
+    gpu_fail(mrb, dev_r == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : dev_r,
+             "vkEnumeratePhysicalDevices", "listing the Vulkan devices");
   }
-  g_ctx.physical_device = devs[0];
-  for (uint32_t i = 0; i < dev_count; i++) {
+  *count = dev_count;
+  return devs;
+}
+
+GpuDeviceEntry *gpu_devices_list(mrb_state *mrb, uint32_t *count) {
+  VkPhysicalDevice *devs = physical_devices(mrb, count);
+  GpuDeviceEntry *entries = malloc(sizeof(GpuDeviceEntry) * *count);
+  if (!entries) {
+    free(devs);
+    GPU_RAISE(mrb, GPU_RT_ERROR_OUT_OF_MEMORY, "out of memory enumerating devices");
+  }
+  for (uint32_t i = 0; i < *count; i++) {
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(devs[i], &p);
-    if (p.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
-      g_ctx.physical_device = devs[i];
-      break;
+    memcpy(entries[i].name, p.deviceName, sizeof(entries[i].name));
+    entries[i].name[sizeof(entries[i].name) - 1] = '\0';
+    entries[i].type = p.deviceType;
+  }
+  free(devs);
+  return entries;
+}
+
+const char *gpu_device_type_name(VkPhysicalDeviceType type) {
+  switch (type) {
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "integrated";
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return "discrete";
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    return "virtual";
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:            return "cpu";
+    default:                                     return "other";
+  }
+}
+
+static char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
+
+/* Whether `hay` contains `needle`, ignoring ASCII case; with `whole`, whether
+ * they are equal. */
+static int name_matches(const char *hay, const char *needle, int whole) {
+  size_t hn = strlen(hay), nn = strlen(needle);
+  if (nn == 0 || nn > hn || (whole && nn != hn)) return 0;
+  for (size_t at = 0; at + nn <= hn; at++) {
+    size_t i = 0;
+    while (i < nn && lower(hay[at + i]) == lower(needle[i])) i++;
+    if (i == nn) return 1;
+    if (whole) break;
+  }
+  return 0;
+}
+
+/* The index of the device `name` means, or -1. */
+static int device_by_name(const GpuDeviceEntry *entries, uint32_t count, const char *name) {
+  for (int whole = 1; whole >= 0; whole--) {
+    for (uint32_t i = 0; i < count; i++) {
+      if (name_matches(entries[i].name, name, whole)) return (int)i;
     }
   }
+  return -1;
+}
+
+/* Free `entries` and raise `klass` with `what` followed by the list of
+ * devices, so the message shows what could have been chosen. */
+static void raise_with_devices(mrb_state *mrb, struct RClass *klass, const char *what,
+                               GpuDeviceEntry *entries, uint32_t count) {
+  mrb_value msg = mrb_str_new_cstr(mrb, what);
+  mrb_str_cat_cstr(mrb, msg, " The devices are:");
+  for (uint32_t i = 0; i < count; i++) {
+    char line[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE + 64];
+    snprintf(line, sizeof(line), "%s %u: \"%s\" (%s)", i ? "," : "", (unsigned)i,
+             entries[i].name, gpu_device_type_name(entries[i].type));
+    mrb_str_cat_cstr(mrb, msg, line);
+  }
+  free(entries);
+  mrb_exc_raise(mrb, mrb_exc_new_str(mrb, klass, msg));
+}
+
+/* The device used when GPU.device= has said nothing: MRUBY_GPU_DEVICE, or
+ * the first device that is not a CPU. Raises, after freeing `entries`, when
+ * the variable matches no device. */
+static uint32_t default_device(mrb_state *mrb, GpuDeviceEntry *entries, uint32_t count) {
+  const char *env = getenv(GPU_DEVICE_ENV);
+  if (env && env[0] != '\0') {
+    int found = -1;
+    if (strspn(env, "0123456789") == strlen(env)) {
+      unsigned long n = strtoul(env, NULL, 10);
+      if (strlen(env) <= 9 && n < count) found = (int)n;
+    } else {
+      found = device_by_name(entries, count, env);
+    }
+    if (found < 0) {
+      char what[256];
+      snprintf(what, sizeof(what),
+        "no Vulkan device matches the environment variable " GPU_DEVICE_ENV "=%.100s.", env);
+      raise_with_devices(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_DEVICE), what, entries,
+                         count);
+    }
+    return (uint32_t)found;
+  }
+  /* Prefer a real GPU over a software rasterizer. The Pi exposes both V3D
+   * (hardware) and llvmpipe (CPU); pick the first non-CPU device so compute
+   * actually runs on the GPU. Falls back to the first device if every device
+   * is CPU-type. */
+  for (uint32_t i = 0; i < count; i++) {
+    if (entries[i].type != VK_PHYSICAL_DEVICE_TYPE_CPU) return i;
+  }
+  return 0;
+}
+
+void gpu_device_choose(mrb_state *mrb, int by_index, mrb_int index, const char *name) {
+  uint32_t count = 0;
+  GpuDeviceEntry *entries = gpu_devices_list(mrb, &count);
+  uint32_t chosen;
+  char what[256];
+
+  if (by_index) {
+    if (index < 0 || (uint64_t)index >= count) {
+      snprintf(what, sizeof(what), "GPU.device = %ld: no Vulkan device has this index.",
+               (long)index);
+      raise_with_devices(mrb, E_ARGUMENT_ERROR, what, entries, count);
+    }
+    chosen = (uint32_t)index;
+  } else if (name) {
+    int found = device_by_name(entries, count, name);
+    if (found < 0) {
+      snprintf(what, sizeof(what), "GPU.device = \"%.100s\": no Vulkan device has this name.",
+               name);
+      raise_with_devices(mrb, E_ARGUMENT_ERROR, what, entries, count);
+    }
+    chosen = (uint32_t)found;
+  } else {
+    /* nil forgets an earlier choice even when the default then turns out to
+     * be an MRUBY_GPU_DEVICE that matches nothing: the start reports that. */
+    if (!g_ctx.initialized) g_ctx.choice_set = 0;
+    chosen = default_device(mrb, entries, count);
+  }
+
+  if (g_ctx.initialized && chosen != g_ctx.device_index) {
+    snprintf(what, sizeof(what),
+      "GPU.device=: the device has already started on %u: \"%.100s\", and cannot change to "
+      "%u. Choose before the first GPU operation, or set " GPU_DEVICE_ENV ".",
+      (unsigned)g_ctx.device_index,
+      g_ctx.device_index < count ? entries[g_ctx.device_index].name : "?", (unsigned)chosen);
+    raise_with_devices(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_GENERIC), what, entries,
+                       count);
+  }
+  free(entries);
+  g_ctx.choice_set = (by_index || name) ? 1 : 0;
+  g_ctx.choice_index = chosen;
+}
+
+/* ---- Features ----
+ *
+ * What gpu_rt_context_has_feature and GPU.info[:features] answer. Two of the
+ * four need nothing turned on, and the other two are turned on at device
+ * creation whenever the device has them, so that a gem can rely on a "yes":
+ *
+ *   storage_8bit     VK_KHR_8bit_storage with storageBuffer8BitAccess; the
+ *                    extension and the feature are enabled. (A Vulkan 1.2
+ *                    device has the feature in core, but the instance asks
+ *                    for 1.1, where it is reached through the extension.)
+ *   timestamp_query  the compute queue family has timestampValidBits, and
+ *                    timestampPeriod is positive. Nothing to enable.
+ *   subgroups        VkPhysicalDeviceSubgroupProperties: the compute stage
+ *                    with at least the basic operations. Nothing to enable.
+ *   memory_budget    VK_EXT_memory_budget; the extension is enabled.
+ *
+ * Fallback names for SDK headers that predate an extension, as above. */
+#define GPU_8BIT_STORAGE_EXT  "VK_KHR_8bit_storage"
+#define GPU_MEMORY_BUDGET_EXT "VK_EXT_memory_budget"
+
+/* ---- Init ---- */
+void gpu_init(mrb_state *mrb) {
+  if (g_ctx.initialized) return;
+  /* A half-built context cannot be reused, and retrying would leak everything
+   * the failed attempt created -- once per operation, since initialization is
+   * lazy. One attempt per process; fix the environment and restart. */
+  if (g_ctx.init_failed) {
+    GPU_RAISE(mrb, GPU_RT_ERROR_DEVICE,
+      "GPU initialization already failed in this process and is not retried");
+  }
+
+  /* Instance and physical device. Nothing here leaves anything half-built
+   * (the instance is kept and reused), so a failure up to the device's
+   * creation can be retried, for example after choosing another device. */
+  uint32_t dev_count = 0;
+  GpuDeviceEntry *entries = gpu_devices_list(mrb, &dev_count);
+  uint32_t dev_index = g_ctx.choice_set ? g_ctx.choice_index
+                                        : default_device(mrb, entries, dev_count);
+  free(entries);
+  VkPhysicalDevice *devs = physical_devices(mrb, &dev_count);
+  if (dev_index >= dev_count) {
+    free(devs);
+    mrb_raisef(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_DEVICE),
+      "the chosen Vulkan device %d is gone; %d devices are left", (int)dev_index, (int)dev_count);
+  }
+  g_ctx.physical_device = devs[dev_index];
+  g_ctx.device_index = dev_index;
   free(devs);
 
   /* Remember the dispatch limit, so an oversized array is reported rather
@@ -583,6 +852,7 @@ void gpu_init(mrb_state *mrb) {
   VkPhysicalDeviceProperties dev_props;
   vkGetPhysicalDeviceProperties(g_ctx.physical_device, &dev_props);
   g_ctx.max_workgroups = dev_props.limits.maxComputeWorkGroupCount[0];
+  g_ctx.device_type = dev_props.deviceType;
 
   /* What one layout may bind (gpu_rt_pipeline_create checks a description
    * against these). All of a layout's bindings are in one set and one stage,
@@ -606,22 +876,67 @@ void gpu_init(mrb_state *mrb) {
   uint32_t qf_count = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(g_ctx.physical_device, &qf_count, NULL);
   VkQueueFamilyProperties *qf_props = malloc(sizeof(VkQueueFamilyProperties) * qf_count);
-  if (!qf_props) mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory enumerating queue families");
+  if (!qf_props) GPU_RAISE(mrb, GPU_RT_ERROR_OUT_OF_MEMORY, "out of memory enumerating queue families");
   vkGetPhysicalDeviceQueueFamilyProperties(g_ctx.physical_device, &qf_count, qf_props);
   int have_compute = 0;
+  uint32_t timestamp_valid_bits = 0;
   g_ctx.queue_family = 0;
   for (uint32_t i = 0; i < qf_count; i++) {
     if (qf_props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
       g_ctx.queue_family = i;
+      timestamp_valid_bits = qf_props[i].timestampValidBits;
       have_compute = 1;
       break;
     }
   }
   free(qf_props);
   if (!have_compute) {
-    mrb_raisef(mrb, E_RUNTIME_ERROR,
+    mrb_raisef(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_DEVICE),
       "device '%s' has no compute-capable queue family", dev_props.deviceName);
   }
+
+  /* Features (see "Features" above). The structs chained below need a
+   * device that speaks Vulkan 1.1; an older one reports none of them. */
+  int features[GPU_RT_FEATURE_COUNT] = {0};
+  uint32_t subgroup_size = 0;
+  int have_8bit = 0, have_budget = 0;
+  features[GPU_RT_FEATURE_TIMESTAMP_QUERY] =
+    timestamp_valid_bits != 0 && dev_props.limits.timestampPeriod > 0.0f;
+  if (dev_props.apiVersion >= VK_API_VERSION_1_1) {
+    VkPhysicalDeviceSubgroupProperties subgroup = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES
+    };
+    VkPhysicalDeviceProperties2 props2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+      .pNext = &subgroup
+    };
+    vkGetPhysicalDeviceProperties2(g_ctx.physical_device, &props2);
+    if ((subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) &&
+        subgroup.subgroupSize > 0) {
+      features[GPU_RT_FEATURE_SUBGROUPS] = 1;
+      subgroup_size = subgroup.subgroupSize;
+    }
+#ifdef VK_KHR_8bit_storage
+    if (has_device_ext(g_ctx.physical_device, GPU_8BIT_STORAGE_EXT)) {
+      VkPhysicalDevice8BitStorageFeaturesKHR f8 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR
+      };
+      VkPhysicalDeviceFeatures2 feats2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &f8
+      };
+      vkGetPhysicalDeviceFeatures2(g_ctx.physical_device, &feats2);
+      have_8bit = f8.storageBuffer8BitAccess == VK_TRUE;
+    }
+#endif
+    have_budget = has_device_ext(g_ctx.physical_device, GPU_MEMORY_BUDGET_EXT);
+  }
+  features[GPU_RT_FEATURE_STORAGE_8BIT] = have_8bit;
+  features[GPU_RT_FEATURE_MEMORY_BUDGET] = have_budget;
+
+  /* From here a failure leaves a device or its objects behind. */
+  g_ctx.init_failed = 1;   /* cleared only on the success path at the end */
 
   /* Device + Queue */
   float priority = 1.0f;
@@ -633,13 +948,28 @@ void gpu_init(mrb_state *mrb) {
   };
   /* If the device advertises VK_KHR_portability_subset it MUST be enabled
    * (Vulkan spec). Present on MoltenVK, absent on the Pi's V3D. */
-  const char *dev_exts[1];
+  const char *dev_exts[3];
   uint32_t dev_ext_count = 0;
   if (has_device_ext(g_ctx.physical_device, GPU_PORTABILITY_SUBSET_EXT)) {
     dev_exts[dev_ext_count++] = GPU_PORTABILITY_SUBSET_EXT;
   }
+  /* Turn on what the device has of the optional features, so that a "yes"
+   * from gpu_rt_context_has_feature means a gem may use it. */
+  const void *dev_next = NULL;
+#ifdef VK_KHR_8bit_storage
+  VkPhysicalDevice8BitStorageFeaturesKHR enable_8bit = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR,
+    .storageBuffer8BitAccess = VK_TRUE
+  };
+  if (have_8bit) {
+    dev_exts[dev_ext_count++] = GPU_8BIT_STORAGE_EXT;
+    dev_next = &enable_8bit;
+  }
+#endif
+  if (have_budget) dev_exts[dev_ext_count++] = GPU_MEMORY_BUDGET_EXT;
   VkDeviceCreateInfo dev_info = {
     .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+    .pNext = dev_next,
     .queueCreateInfoCount = 1,
     .pQueueCreateInfos = &q_info,
     .enabledExtensionCount = dev_ext_count,
@@ -647,6 +977,10 @@ void gpu_init(mrb_state *mrb) {
   };
   VK_CHECK(mrb, vkCreateDevice(g_ctx.physical_device, &dev_info, NULL, &g_ctx.device));
   vkGetDeviceQueue(g_ctx.device, g_ctx.queue_family, 0, &g_ctx.queue);
+  memcpy(g_ctx.features, features, sizeof(g_ctx.features));
+  g_ctx.timestamp_period = dev_props.limits.timestampPeriod;
+  g_ctx.timestamp_valid_bits = timestamp_valid_bits;
+  g_ctx.subgroup_size = subgroup_size;
 
   /* Command Pool */
   VkCommandPoolCreateInfo pool_info = {
@@ -682,7 +1016,8 @@ void gpu_init(mrb_state *mrb) {
   g_ctx.want_storage = g_ctx.pool_storage = 3 * GPU_MAX_DESC_SETS;
   g_ctx.want_uniform = g_ctx.pool_uniform = 0;
   g_ctx.batch_storage = g_ctx.batch_uniform = 0;
-  VK_CHECK(mrb, create_desc_pool(g_ctx.pool_storage, g_ctx.pool_uniform, &g_ctx.desc_pool));
+  gpu_check(mrb, create_desc_pool(g_ctx.pool_storage, g_ctx.pool_uniform, &g_ctx.desc_pool),
+            "vkCreateDescriptorPool");
 
   g_ctx.initialized = 1;
   g_ctx.init_failed = 0;
@@ -697,7 +1032,18 @@ void gpu_ensure_initialized(mrb_state *mrb) {
  * Runs from the gem's final. mruby calls the finals of dependent gems first,
  * so by now they have destroyed the pipelines they created. */
 void gpu_shutdown(mrb_state *mrb) {
-  if (!g_ctx.initialized) return;
+  /* A choice belongs to the mruby that made it, not to the next one. */
+  g_ctx.choice_set = 0;
+  if (!g_ctx.initialized) {
+    /* GPU.devices or GPU.device= made the instance, and nothing started the
+     * device. After a failed start the instance may still carry a device,
+     * so it is left alone. */
+    if (g_ctx.instance_ready && !g_ctx.init_failed) {
+      vkDestroyInstance(g_ctx.instance, NULL);
+      g_ctx.instance_ready = 0;
+    }
+    return;
+  }
   /* Whatever is still recorded was never submitted and nobody can observe it
    * now, so it is dropped rather than run. Nothing is in flight: every submit
    * is waited on before gpu_flush returns. */
@@ -727,5 +1073,6 @@ void gpu_shutdown(mrb_state *mrb) {
   vkDestroyCommandPool(g_ctx.device, g_ctx.cmd_pool, NULL);
   vkDestroyDevice(g_ctx.device, NULL);
   vkDestroyInstance(g_ctx.instance, NULL);
+  g_ctx.instance_ready = 0;
   g_ctx.initialized = 0;
 }

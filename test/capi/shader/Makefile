@@ -3,7 +3,7 @@
 # glslangValidator.
 GLSLANG ?= glslangValidator
 
-all: ../src/axpy_spv.h ../src/inc_spv.h ../src/blend_spv.h ../src/ones_spv.h
+all: ../src/axpy_spv.h ../src/inc_spv.h ../src/blend_spv.h ../src/ones_spv.h ../src/widen_spv.h
 
 ../src/%_spv.h: %.comp
 	$(GLSLANG) -V --vn $*_spv $< -o $@

@@ -59,6 +59,10 @@
  *    in that case, and returns no error code. Whatever the caller allocated
  *    and the GC does not own must be released before the call.
  *    gpu_rt_pipeline_create() can report instead of raising; see there.
+ *  - What the device, the driver or a shader does wrong is raised as GPU::Error
+ *    or one of its subclasses; see "Errors" below. A mistake in a call (a NULL
+ *    description, a dispatch that does not fit its pipeline) is an
+ *    ArgumentError or a TypeError.
  *  - A descriptor struct (gpu_rt_buffer_desc, gpu_rt_layout,
  *    gpu_rt_dispatch_desc) is passed by pointer and read during the call
  *    only. Fill it with designated initializers: a member this header gains
@@ -118,13 +122,31 @@ typedef struct gpu_rt_pipeline gpu_rt_pipeline;  /* a compute shader ready to di
 
 /* The context of this mruby. The first call starts Vulkan (instance, device,
  * queue), so a program that never touches the GPU never pays for it; later
- * calls only return the handle. Raises if there is no usable device. The
- * handle is valid until the mruby state is closed, and must not be kept
- * across that. */
+ * calls only return the handle. Raises GPU::DeviceError if there is no usable
+ * device (GPU::OutOfMemoryError or GPU::UnsupportedError when the VkResult
+ * says so). The handle is valid until the mruby state is closed, and must not
+ * be kept across that.
+ *
+ * This is where the device is chosen, once: what the program said with
+ * `GPU.device = index_or_name` before this call, else the environment
+ * variable MRUBY_GPU_DEVICE (an index or a name), else the first device that
+ * is not a CPU. A gem does not choose; the program does (README.md, "Devices
+ * and features"). Raises GPU::DeviceError when MRUBY_GPU_DEVICE matches no
+ * device. */
 gpu_rt_context *gpu_rt_context_get(mrb_state *mrb);
 
 /* Whether the context has been started. Never starts it and never raises. */
 mrb_bool gpu_rt_context_ready(mrb_state *mrb);
+
+/* What kind of device it is. GPU_RT_DEVICE_CPU is a software rasterizer such
+ * as llvmpipe or lavapipe. */
+typedef enum gpu_rt_device_type {
+  GPU_RT_DEVICE_OTHER = 0,
+  GPU_RT_DEVICE_INTEGRATED,
+  GPU_RT_DEVICE_DISCRETE,
+  GPU_RT_DEVICE_VIRTUAL,
+  GPU_RT_DEVICE_CPU
+} gpu_rt_device_type;
 
 typedef struct gpu_rt_device_info {
   const char *name;            /* the device's own name, e.g. "V3D 7.1.7.0" */
@@ -133,6 +155,8 @@ typedef struct gpu_rt_device_info {
   uint32_t    api_minor;
   uint32_t    api_patch;
   uint32_t    max_workgroups;  /* the largest groups[0] one dispatch may have */
+  uint32_t    index;           /* which of GPU.devices this is */
+  gpu_rt_device_type type;
 } gpu_rt_device_info;
 
 /* Fill `*out` with what GPU.info reports. The strings belong to the runtime
@@ -142,17 +166,23 @@ void gpu_rt_context_info(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_device_info
 /* What a device may or may not be able to do. A gem asks before it relies on
  * one, and takes another path or raises when the answer is no. */
 typedef enum gpu_rt_feature {
-  GPU_RT_FEATURE_STORAGE_8BIT = 0,  /* 8-bit integers in storage buffers */
-  GPU_RT_FEATURE_TIMESTAMP_QUERY,   /* per-dispatch GPU time */
-  GPU_RT_FEATURE_SUBGROUPS,         /* subgroup operations in compute shaders */
-  GPU_RT_FEATURE_MEMORY_BUDGET,     /* the device reports how much memory is left */
+  GPU_RT_FEATURE_STORAGE_8BIT = 0,  /* 8-bit integers in storage buffers
+                                     * (storageBuffer8BitAccess): a shader may declare
+                                     * uint8_t / int8_t members in a storage block */
+  GPU_RT_FEATURE_TIMESTAMP_QUERY,   /* per-dispatch GPU time: the compute queue
+                                     * writes timestamps */
+  GPU_RT_FEATURE_SUBGROUPS,         /* subgroup operations in compute shaders, at
+                                     * least the basic ones */
+  GPU_RT_FEATURE_MEMORY_BUDGET,     /* the device reports how much memory is left
+                                     * (VK_EXT_memory_budget) */
   GPU_RT_FEATURE_COUNT
 } gpu_rt_feature;
 
-/* True when the device has the feature *and* the runtime has turned it on.
- * The runtime does not turn any of them on yet, so every answer is false
- * until device selection and feature reporting land (runtime#6). An unknown
- * value is false too. */
+/* True when the device has the feature *and* the runtime has turned it on,
+ * so a shader or a gem may use it. The runtime turns on every one of them
+ * that the device has, when the device starts. GPU.info[:features] gives the
+ * same answers to Ruby, under the keys :storage_8bit, :timestamp_query,
+ * :subgroups and :memory_budget. An unknown value is false. */
 mrb_bool gpu_rt_context_has_feature(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_feature feature);
 
 /* What this device allows in one layout (see gpu_rt_layout). The numbers
@@ -175,16 +205,63 @@ void gpu_rt_context_limits(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_limits *o
 #define GPU_RT_BUFFER_STORAGE (1u << 0)   /* bound to a pipeline as a storage buffer */
 #define GPU_RT_BUFFER_UNIFORM (1u << 1)   /* bound to a pipeline as a uniform buffer */
 
+/* What one element of a buffer is. The runtime records it and does not
+ * convert: the bytes are the host's, in host byte order, and the shader that
+ * a gem dispatches must read them the same way.
+ *
+ *   dtype                  bytes per element (gpu_rt_dtype_size)
+ *   GPU_RT_DTYPE_FLOAT32   4
+ *   GPU_RT_DTYPE_UINT8     1
+ *   GPU_RT_DTYPE_UINT16    2
+ *   GPU_RT_DTYPE_INT32     4
+ *
+ * FLOAT32 is 0, so a description that does not name a dtype is float32. */
+typedef enum gpu_rt_dtype {
+  GPU_RT_DTYPE_FLOAT32 = 0,
+  GPU_RT_DTYPE_UINT8,
+  GPU_RT_DTYPE_UINT16,
+  GPU_RT_DTYPE_INT32,
+  GPU_RT_DTYPE_COUNT
+} gpu_rt_dtype;
+
+/* The most dimensions a buffer's shape may have. */
+#define GPU_RT_MAX_DIMS 4
+
 typedef struct gpu_rt_buffer_desc {
   size_t   size;    /* in bytes; 0 is allowed and makes an empty buffer */
   uint32_t usage;   /* GPU_RT_BUFFER_* bits, at least one */
-  /* A dtype and a shape join this struct with runtime#4. Left at zero they
-   * will mean what every buffer is today: float32, one dimension. */
+  gpu_rt_dtype dtype;                /* 0 is GPU_RT_DTYPE_FLOAT32 */
+  uint32_t ndim;                     /* dimensions, 0 .. GPU_RT_MAX_DIMS; 0 means one
+                                      * dimension whose extent comes from `size` */
+  uint32_t shape[GPU_RT_MAX_DIMS];   /* the extent of each of the `ndim` dimensions,
+                                      * outermost first (row-major); 0 is allowed */
 } gpu_rt_buffer_desc;
 
+/* How `size` and the shape relate. A buffer always holds a whole number of
+ * elements: gpu_rt_buffer_size() == gpu_rt_buffer_count() * gpu_rt_dtype_size().
+ *
+ *  - `ndim` is 0: the buffer has one dimension of `size` / element size
+ *    elements. So { .size = n * sizeof(float), .usage = ... } is n float32,
+ *    as it was before buffers had a dtype.
+ *  - `ndim` is not 0 and `size` is 0: the size is the product of the extents
+ *    times the element size. This is the form to prefer.
+ *  - both are given: they must agree.
+ *
+ * gpu_rt_buffer_create() raises ArgumentError when `size` is not a whole
+ * number of elements, when `size` and the shape disagree, when the product
+ * does not fit in a size_t, for more than GPU_RT_MAX_DIMS dimensions, and for
+ * an unknown dtype. An extent of the description past `ndim` is ignored.
+ *
+ * The memory behind a buffer is a whole number of 32-bit words, whatever the
+ * dtype. A shader for a device without 8-bit or 16-bit storage access
+ * (GPU_RT_FEATURE_STORAGE_8BIT) can therefore declare a uint8 or uint16
+ * buffer as `uint data[]` and unpack the elements itself. The bytes between
+ * gpu_rt_buffer_size() and the next multiple of 4 are undefined, can be
+ * written through the mapping, and no element lives there. */
+
 /* Create a buffer. Its contents are undefined until written. The host can
- * always map it. Raises ArgumentError for a bad description and RuntimeError
- * when the device cannot provide the memory.
+ * always map it. Raises ArgumentError for a bad description and
+ * GPU::OutOfMemoryError when the device cannot provide the memory.
  *
  * The caller owns the returned buffer until it passes it to
  * gpu_rt_buffer_wrap() or gpu_rt_buffer_release(). Do one of them before
@@ -213,17 +290,49 @@ void gpu_rt_buffer_release(mrb_state *mrb, gpu_rt_buffer *buf);
 gpu_rt_buffer *gpu_rt_buffer_get(mrb_state *mrb, mrb_value obj);
 gpu_rt_buffer *gpu_rt_buffer_check(mrb_state *mrb, mrb_value obj);
 
-/* The size in bytes the buffer was created with. */
+/* The size in bytes: what the buffer was created with, or what its shape
+ * and dtype come to. */
 size_t gpu_rt_buffer_size(mrb_state *mrb, gpu_rt_buffer *buf);
 
 /* Map the buffer into host memory, for reading and writing gpu_rt_buffer_size()
  * bytes. Recorded dispatches that touch this buffer are run and waited for
  * first, so the bytes are the current ones. Never returns NULL; raises
- * RuntimeError when the mapping fails. Unmap before the next dispatch that
+ * GPU::Error (GPU::OutOfMemoryError as a rule) when the mapping fails. Unmap before the next dispatch that
  * uses the buffer, and do not map a buffer twice. The pointer of an empty
  * buffer must not be dereferenced. */
 void *gpu_rt_buffer_map(mrb_state *mrb, gpu_rt_buffer *buf);
 void  gpu_rt_buffer_unmap(mrb_state *mrb, gpu_rt_buffer *buf);
+
+/* ---- Dtype and shape of a buffer ----
+ *
+ * What the buffer was created with, for any buffer: one the gem created, or
+ * one passed in from Ruby and read with gpu_rt_buffer_get() or
+ * gpu_rt_buffer_check(). They are fixed for the life of the buffer. None of
+ * these functions raises, waits for the batch or starts the device. */
+
+/* The element type. */
+gpu_rt_dtype gpu_rt_buffer_dtype(mrb_state *mrb, gpu_rt_buffer *buf);
+
+/* The number of dimensions, 1 .. GPU_RT_MAX_DIMS. */
+uint32_t gpu_rt_buffer_ndim(mrb_state *mrb, gpu_rt_buffer *buf);
+
+/* Copy the shape into `shape_out`, which has room for GPU_RT_MAX_DIMS
+ * extents: the first gpu_rt_buffer_ndim() are the buffer's, outermost first,
+ * and the rest are set to 0. */
+void gpu_rt_buffer_shape(mrb_state *mrb, gpu_rt_buffer *buf,
+                         uint32_t shape_out[GPU_RT_MAX_DIMS]);
+
+/* The number of elements: the product of the extents. */
+size_t gpu_rt_buffer_count(mrb_state *mrb, gpu_rt_buffer *buf);
+
+/* The bytes one element of `dtype` takes, or 0 for a value that is not a
+ * dtype. */
+size_t gpu_rt_dtype_size(mrb_state *mrb, gpu_rt_dtype dtype);
+
+/* The name of `dtype` for messages and for Ruby ("float32", "uint8",
+ * "uint16", "int32"), or "unknown" for a value that is not a dtype. The
+ * string belongs to the runtime. */
+const char *gpu_rt_dtype_name(mrb_state *mrb, gpu_rt_dtype dtype);
 
 /* ---- Pipelines ---- */
 
@@ -253,11 +362,53 @@ typedef struct gpu_rt_layout {
   uint32_t uniform_buffers;      /* 0 .. max_uniform_buffers; usually 0 or 1 */
 } gpu_rt_layout;
 
+/* ---- Errors ----
+ *
+ * The exception classes of every GPU gem. The runtime defines them, so they
+ * exist before any other GPU gem is initialised:
+ *
+ *   StandardError
+ *     GPU::Error                 anything the GPU side does wrong
+ *       GPU::DeviceError         no usable device, initialisation failed, device lost
+ *       GPU::OutOfMemoryError    host or device memory, or another resource, ran out
+ *       GPU::UnsupportedError    the device lacks an extension, a feature or a format
+ *       GPU::CompileError        a shader could not be made into a pipeline
+ *     ArgumentError
+ *       GPU::ShapeError          arrays whose sizes or shapes do not fit the operation
+ *
+ * GPU::ShapeError is an ArgumentError and not a GPU::Error: it is the
+ * caller's mistake, and `rescue ArgumentError` keeps catching it.
+ *
+ * The runtime chooses the class of a failed Vulkan call from its VkResult
+ * (the table is in README.md, "Errors"), and its message names the operation,
+ * the Vulkan call and the VkResult. */
+typedef enum gpu_rt_error_kind {
+  GPU_RT_ERROR_GENERIC = 0,     /* GPU::Error */
+  GPU_RT_ERROR_DEVICE,          /* GPU::DeviceError */
+  GPU_RT_ERROR_OUT_OF_MEMORY,   /* GPU::OutOfMemoryError */
+  GPU_RT_ERROR_UNSUPPORTED,     /* GPU::UnsupportedError */
+  GPU_RT_ERROR_COMPILE,         /* GPU::CompileError */
+  GPU_RT_ERROR_SHAPE,           /* GPU::ShapeError */
+  GPU_RT_ERROR_KIND_COUNT
+} gpu_rt_error_kind;
+
+/* The exception class of a kind, for a gem that raises one itself:
+ *
+ *   mrb_raisef(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_SHAPE),
+ *              "shape mismatch: %d vs %d", (int)n, (int)m);
+ *
+ * An unknown kind gives GPU::Error. Does not start the device. */
+struct RClass *gpu_rt_error_class(mrb_state *mrb, gpu_rt_error_kind kind);
+
 /* Why gpu_rt_pipeline_create() failed. */
 typedef struct gpu_rt_error {
   const char *operation;   /* the step that failed, e.g. "creating the compute pipeline" */
   const char *reason;      /* in words, e.g. "out of device memory" */
   int32_t     vk_result;   /* the VkResult, or 0 when the failure is not Vulkan's */
+  gpu_rt_error_kind kind;  /* what the runtime would have raised: pass it to
+                            * gpu_rt_error_class(). GPU_RT_ERROR_COMPILE unless
+                            * the VkResult says memory, the device or a missing
+                            * feature. */
 } gpu_rt_error;
 
 /* Create a compute pipeline from `spirv_size` bytes of SPIR-V with the entry
@@ -268,8 +419,9 @@ typedef struct gpu_rt_error {
  * SPIR-V the device does not accept is an expected failure, and gems want to
  * say different things about it, so the caller chooses:
  *
- *  - `error_out` is NULL: raises RuntimeError naming the label, the failed
- *    step and the VkResult.
+ *  - `error_out` is NULL: raises GPU::CompileError, or the GPU::Error subclass
+ *    the VkResult stands for, naming the label, the failed step and the
+ *    VkResult.
  *  - `error_out` is not NULL: returns NULL and fills `*error_out`. On success
  *    `*error_out` is zeroed.
  *
@@ -330,13 +482,16 @@ typedef struct gpu_rt_dispatch_desc {
  * dispatches that use it.
  *
  * Raises ArgumentError when the description does not fit the pipeline, or
- * when groups[0] is more than the device allows in one dispatch. */
+ * when groups[0] is more than the device allows in one dispatch, and
+ * GPU::Error or a subclass when the device fails; the message then starts
+ * with the label. */
 void gpu_rt_dispatch(mrb_state *mrb, const gpu_rt_dispatch_desc *desc);
 
 /* ---- Sync ---- */
 
 /* Run everything recorded and wait for it. Returns at once when nothing is
- * recorded. Raises RuntimeError if the device fails. */
+ * recorded. Raises GPU::DeviceError if the device is lost, and GPU::Error or
+ * another subclass for any other failure of the device. */
 void gpu_rt_sync(mrb_state *mrb, gpu_rt_context *ctx);
 
 /* The same, but only if a recorded dispatch touches `buf`. */

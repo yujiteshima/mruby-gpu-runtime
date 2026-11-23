@@ -47,9 +47,18 @@ GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t u
   buf->usage = usage;
   buf->buffer = VK_NULL_HANDLE;
   buf->memory = VK_NULL_HANDLE;
-  buf->bytes = size;
+  /* Whole 32-bit words, so that a shader can read a uint8 or uint16 buffer as
+   * uint[] on a device without 8-bit or 16-bit storage access. */
+  buf->bytes = (size + 3) & ~(VkDeviceSize)3;
   buf->epoch = 0;   /* never bound; no batch can be waiting on it */
   if (buf->bytes == 0) buf->bytes = sizeof(float); /* avoid zero-size allocation */
+  char op[64];   /* the operation, for the message of a failure below */
+  snprintf(op, sizeof(op), "creating a buffer of %llu bytes", (unsigned long long)size);
+  buf->dtype = GPU_RT_DTYPE_FLOAT32;
+  buf->ndim = 1;
+  buf->count = (size_t)(size / sizeof(float));
+  buf->shape[0] = (uint32_t)buf->count;
+  for (int i = 1; i < GPU_RT_MAX_DIMS; i++) buf->shape[i] = 0;
 
   VkBufferUsageFlags vk_usage = 0;
   if (usage & GPU_RT_BUFFER_STORAGE) vk_usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -64,7 +73,7 @@ GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t u
   VkResult r = vkCreateBuffer(g_ctx.device, &bi, NULL, &buf->buffer);
   if (r != VK_SUCCESS) {
     mrb_free(mrb, buf);
-    gpu_check(mrb, r, "vkCreateBuffer");
+    gpu_fail(mrb, r, "vkCreateBuffer", op);
   }
 
   VkMemoryRequirements req;
@@ -89,7 +98,7 @@ GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t u
   if (mem_idx == UINT32_MAX) {
     vkDestroyBuffer(g_ctx.device, buf->buffer, NULL);
     mrb_free(mrb, buf);
-    mrb_raise(mrb, E_RUNTIME_ERROR,
+    GPU_RAISE(mrb, GPU_RT_ERROR_UNSUPPORTED,
       "no host-visible, host-coherent memory type is available for a buffer");
   }
 
@@ -102,7 +111,7 @@ GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t u
   if (r != VK_SUCCESS) {
     vkDestroyBuffer(g_ctx.device, buf->buffer, NULL);
     mrb_free(mrb, buf);
-    gpu_check(mrb, r, "vkAllocateMemory");
+    gpu_fail(mrb, r, "vkAllocateMemory", op);
   }
 
   r = vkBindBufferMemory(g_ctx.device, buf->buffer, buf->memory, 0);
@@ -110,7 +119,7 @@ GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t u
     vkFreeMemory(g_ctx.device, buf->memory, NULL);
     vkDestroyBuffer(g_ctx.device, buf->buffer, NULL);
     mrb_free(mrb, buf);
-    gpu_check(mrb, r, "vkBindBufferMemory");
+    gpu_fail(mrb, r, "vkBindBufferMemory", op);
   }
 
   return buf;
@@ -163,9 +172,10 @@ mrb_value wrap_buffer(mrb_state *mrb, struct RClass *klass, GpuBuffer *buf) {
 void *map_buffer(mrb_state *mrb, GpuBuffer *buf) {
   gpu_sync_buffer(mrb, buf);
   void *mapped = NULL;
-  VK_CHECK(mrb, vkMapMemory(g_ctx.device, buf->memory, 0, buf->bytes, 0, &mapped));
+  VkResult r = vkMapMemory(g_ctx.device, buf->memory, 0, buf->bytes, 0, &mapped);
+  if (r != VK_SUCCESS) gpu_fail(mrb, r, "vkMapMemory", "mapping a buffer");
   if (!mapped) {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "vkMapMemory returned no pointer");
+    GPU_RAISE(mrb, GPU_RT_ERROR_GENERIC, "mapping a buffer: vkMapMemory returned no pointer");
   }
   return mapped;
 }
