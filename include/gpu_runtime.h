@@ -125,11 +125,28 @@ typedef struct gpu_rt_pipeline gpu_rt_pipeline;  /* a compute shader ready to di
  * calls only return the handle. Raises GPU::DeviceError if there is no usable
  * device (GPU::OutOfMemoryError or GPU::UnsupportedError when the VkResult
  * says so). The handle is valid until the mruby state is closed, and must not
- * be kept across that. */
+ * be kept across that.
+ *
+ * This is where the device is chosen, once: what the program said with
+ * `GPU.device = index_or_name` before this call, else the environment
+ * variable MRUBY_GPU_DEVICE (an index or a name), else the first device that
+ * is not a CPU. A gem does not choose; the program does (README.md, "Devices
+ * and features"). Raises GPU::DeviceError when MRUBY_GPU_DEVICE matches no
+ * device. */
 gpu_rt_context *gpu_rt_context_get(mrb_state *mrb);
 
 /* Whether the context has been started. Never starts it and never raises. */
 mrb_bool gpu_rt_context_ready(mrb_state *mrb);
+
+/* What kind of device it is. GPU_RT_DEVICE_CPU is a software rasterizer such
+ * as llvmpipe or lavapipe. */
+typedef enum gpu_rt_device_type {
+  GPU_RT_DEVICE_OTHER = 0,
+  GPU_RT_DEVICE_INTEGRATED,
+  GPU_RT_DEVICE_DISCRETE,
+  GPU_RT_DEVICE_VIRTUAL,
+  GPU_RT_DEVICE_CPU
+} gpu_rt_device_type;
 
 typedef struct gpu_rt_device_info {
   const char *name;            /* the device's own name, e.g. "V3D 7.1.7.0" */
@@ -138,6 +155,8 @@ typedef struct gpu_rt_device_info {
   uint32_t    api_minor;
   uint32_t    api_patch;
   uint32_t    max_workgroups;  /* the largest groups[0] one dispatch may have */
+  uint32_t    index;           /* which of GPU.devices this is */
+  gpu_rt_device_type type;
 } gpu_rt_device_info;
 
 /* Fill `*out` with what GPU.info reports. The strings belong to the runtime
@@ -147,17 +166,23 @@ void gpu_rt_context_info(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_device_info
 /* What a device may or may not be able to do. A gem asks before it relies on
  * one, and takes another path or raises when the answer is no. */
 typedef enum gpu_rt_feature {
-  GPU_RT_FEATURE_STORAGE_8BIT = 0,  /* 8-bit integers in storage buffers */
-  GPU_RT_FEATURE_TIMESTAMP_QUERY,   /* per-dispatch GPU time */
-  GPU_RT_FEATURE_SUBGROUPS,         /* subgroup operations in compute shaders */
-  GPU_RT_FEATURE_MEMORY_BUDGET,     /* the device reports how much memory is left */
+  GPU_RT_FEATURE_STORAGE_8BIT = 0,  /* 8-bit integers in storage buffers
+                                     * (storageBuffer8BitAccess): a shader may declare
+                                     * uint8_t / int8_t members in a storage block */
+  GPU_RT_FEATURE_TIMESTAMP_QUERY,   /* per-dispatch GPU time: the compute queue
+                                     * writes timestamps */
+  GPU_RT_FEATURE_SUBGROUPS,         /* subgroup operations in compute shaders, at
+                                     * least the basic ones */
+  GPU_RT_FEATURE_MEMORY_BUDGET,     /* the device reports how much memory is left
+                                     * (VK_EXT_memory_budget) */
   GPU_RT_FEATURE_COUNT
 } gpu_rt_feature;
 
-/* True when the device has the feature *and* the runtime has turned it on.
- * The runtime does not turn any of them on yet, so every answer is false
- * until device selection and feature reporting land (runtime#6). An unknown
- * value is false too. */
+/* True when the device has the feature *and* the runtime has turned it on,
+ * so a shader or a gem may use it. The runtime turns on every one of them
+ * that the device has, when the device starts. GPU.info[:features] gives the
+ * same answers to Ruby, under the keys :storage_8bit, :timestamp_query,
+ * :subgroups and :memory_budget. An unknown value is false. */
 mrb_bool gpu_rt_context_has_feature(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_feature feature);
 
 /* ---- Buffers ---- */
