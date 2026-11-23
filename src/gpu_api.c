@@ -74,14 +74,21 @@ void gpu_rt_context_info(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_device_info
   out->api_minor = VK_VERSION_MINOR(props.apiVersion);
   out->api_patch = VK_VERSION_PATCH(props.apiVersion);
   out->max_workgroups = g_ctx.max_workgroups;
+  out->index = g_ctx.device_index;
+  switch (g_ctx.device_type) {
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: out->type = GPU_RT_DEVICE_INTEGRATED; break;
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   out->type = GPU_RT_DEVICE_DISCRETE;   break;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    out->type = GPU_RT_DEVICE_VIRTUAL;    break;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:            out->type = GPU_RT_DEVICE_CPU;        break;
+    default:                                     out->type = GPU_RT_DEVICE_OTHER;      break;
+  }
 }
 
 mrb_bool gpu_rt_context_has_feature(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_feature feature) {
   check_context(mrb, ctx, "gpu_rt_context_has_feature");
-  /* Nothing is detected or enabled at device creation yet (runtime#6), and a
-   * feature that is not enabled must not be used, so the answer is no. */
-  (void)feature;
-  return FALSE;
+  /* Filled in by gpu_init: detected, and turned on where that is needed. */
+  if ((int)feature < 0 || feature >= GPU_RT_FEATURE_COUNT) return FALSE;
+  return g_ctx.features[feature] ? TRUE : FALSE;
 }
 
 /* ---- Buffers ---- */

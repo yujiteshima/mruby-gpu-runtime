@@ -80,6 +80,17 @@ typedef struct {
   GpuBuffer **graveyard;         /* buffers whose Ruby owner died while a batch still referenced them */
   size_t graveyard_len;
   size_t graveyard_cap;
+
+  /* ---- Device choice and features (see "Devices" in gpu_vulkan.c) ---- */
+  int      instance_ready;       /* `instance` exists; it can before the device does */
+  int      choice_set;           /* GPU.device= named a device, and it wins over the default */
+  uint32_t choice_index;         /* its index, when choice_set */
+  uint32_t device_index;         /* index of physical_device among the instance's devices */
+  VkPhysicalDeviceType device_type;
+  int      features[GPU_RT_FEATURE_COUNT];  /* the device has it and gpu_init turned it on */
+  float    timestamp_period;     /* nanoseconds per timestamp tick (for the profiler) */
+  uint32_t timestamp_valid_bits; /* of the compute queue family; 0 = no timestamps */
+  uint32_t subgroup_size;        /* 0 when subgroups are not usable in compute shaders */
 } GpuCtx;
 
 extern GpuCtx g_ctx;
@@ -102,6 +113,32 @@ const char *gpu_result_name(VkResult r);
 /* Create the instance, device, queue, command pool, descriptor layouts and
  * pool. Raises on failure, and is attempted once per process. */
 void gpu_init(mrb_state *mrb);
+
+/* ---- Devices ----
+ *
+ * The instance can exist before the device: listing and choosing devices need
+ * only the instance, and neither starts the device. */
+
+/* What GPU.devices reports about one physical device. */
+typedef struct {
+  char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+  VkPhysicalDeviceType type;
+} GpuDeviceEntry;
+
+/* The instance's devices in index order, in a malloc'ed array the caller
+ * frees. Creates the instance when needed. Raises when Vulkan fails or there
+ * is no device. */
+GpuDeviceEntry *gpu_devices_list(mrb_state *mrb, uint32_t *count);
+
+/* The name GPU.devices and GPU.info use for a device type: "integrated",
+ * "discrete", "virtual", "cpu" or "other". */
+const char *gpu_device_type_name(VkPhysicalDeviceType type);
+
+/* GPU.device=. Exactly one of the three says which device: `index` when
+ * `by_index`, else `name` (matched as README.md describes), else NULL for
+ * the default. Raises ArgumentError when no device matches, and RuntimeError
+ * when the device has started and the choice is another one. */
+void gpu_device_choose(mrb_state *mrb, int by_index, mrb_int index, const char *name);
 
 /* gpu_init unless it has already run. Every entry point that needs the device
  * calls this, so initialization is lazy. */

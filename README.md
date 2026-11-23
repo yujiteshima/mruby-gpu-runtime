@@ -11,10 +11,11 @@ The Vulkan core of mruby-gpu-narray now lives here: device and queue setup, buff
 - The C API is `include/gpu_runtime.h`: opaque handles for the context, buffers and pipelines, and functions that start with `gpu_rt_`. It is at API version 0.1 and may still change; see [Writing a gem on the C API](#writing-a-gem-on-the-c-api).
 - A pipeline's layout is described by value, and today it can be one, two or three storage buffers plus up to 16 bytes of push constants.
 - Each buffer has a `VkDeviceMemory` of its own; there is no memory pool yet.
+- The device can be chosen, and `GPU.info[:features]` says what it can do; see [Devices and features](#devices-and-features).
 
 ## What it will provide
 
-- Device selection and feature reporting (`GPU.info`)
+- Device selection and feature reporting (`GPU.info`): done, see [Devices and features](#devices-and-features)
 - Buffers that carry a dtype and a shape, and a batch that records dispatches and submits them once
 - Pipelines created from SPIR-V, with the shaders embedded in the binary
 - A C API with a single header for gem authors (`include/gpu_runtime.h`)
@@ -24,6 +25,53 @@ The Vulkan core of mruby-gpu-narray now lives here: device and queue setup, buff
 [mruby-gpu-narray](https://github.com/yujiteshima/mruby-gpu-narray) and [mruby-gpu-kernel](https://github.com/yujiteshima/mruby-gpu-kernel) will be rebuilt on top of it. Like them, it links only against the Vulkan loader.
 
 Progress is tracked in the [GitHub Project](https://github.com/users/yujiteshima/projects/3).
+
+## Devices and features
+
+A machine can have several Vulkan devices. A Raspberry Pi 5 has two, the V3D GPU and llvmpipe, which runs on the CPU.
+
+```ruby
+GPU.devices
+# => [{index: 0, name: "V3D 7.1.10.2", type: :integrated},
+#     {index: 1, name: "llvmpipe (LLVM 20.1.2, 128 bits)", type: :cpu}]
+
+GPU.device = 1            # by index
+GPU.device = "llvmpipe"   # or by name
+GPU.device = nil          # the default again
+```
+
+The device starts at the first GPU operation, and it is chosen then, by the first of these that says something:
+
+1. `GPU.device = index_or_name`, called before the first GPU operation.
+2. The environment variable `MRUBY_GPU_DEVICE`, an index or a name. A script that makes no choice then runs unchanged on another device: `MRUBY_GPU_DEVICE=llvmpipe mruby script.rb`.
+3. The first device that is not a CPU, or device 0 when every device is one.
+
+- An index is the position in `GPU.devices`, which is the order Vulkan lists the devices in. That order can differ between machines and drivers; a name does not depend on it.
+- A name matches the device whose name is equal to it, ignoring case. If there is none, it matches a device whose name contains it, so `"V3D"` finds `"V3D 7.1.10.2"` whatever the driver version. When several devices match, the one with the lowest index is used.
+- `type` is `:integrated`, `:discrete`, `:virtual`, `:cpu` (a software rasterizer such as llvmpipe or lavapipe) or `:other`.
+- `GPU.devices` and `GPU.device=` do not start the device.
+- When no device matches, `GPU.device=` raises `ArgumentError`, and a `MRUBY_GPU_DEVICE` that matches nothing raises `RuntimeError` when the device starts. Both messages list the devices.
+- Once the device has started it cannot change, because the buffers and pipelines of every GPU gem live on it. `GPU.device=` then accepts only the device in use, and raises `RuntimeError` for another one.
+
+`GPU.info` describes the device in use:
+
+```ruby
+GPU.info
+# => {device: "V3D 7.1.10.2", api_version: "1.3.305", backend: "Vulkan", max_workgroups: 65535,
+#     device_index: 0, device_type: :integrated,
+#     features: {storage_8bit: true, timestamp_query: true, subgroups: true, memory_budget: false}}
+```
+
+The values above are an example. `GPU.info[:features]` always has these four keys, and each value is `true` or `false`. The keys are stable: code may rely on them.
+
+| Key | `true` when | C API |
+|---|---|---|
+| `:storage_8bit` | The device has `VK_KHR_8bit_storage` with `storageBuffer8BitAccess`: a shader may declare 8-bit integers in a storage buffer. | `GPU_RT_FEATURE_STORAGE_8BIT` |
+| `:timestamp_query` | The compute queue writes timestamps (`timestampValidBits` is not 0, and `timestampPeriod` is positive). | `GPU_RT_FEATURE_TIMESTAMP_QUERY` |
+| `:subgroups` | Compute shaders may use subgroup operations, at least the basic ones (`VkPhysicalDeviceSubgroupProperties`). | `GPU_RT_FEATURE_SUBGROUPS` |
+| `:memory_budget` | The device has `VK_EXT_memory_budget`. | `GPU_RT_FEATURE_MEMORY_BUDGET` |
+
+`true` means that the device has the feature and that the runtime has turned it on, so it can be used. The runtime turns on 8-bit storage and the memory-budget extension whenever the device has them; the other two need nothing turned on. A gem asks with `gpu_rt_context_has_feature`, which gives the same answers.
 
 ## Depending on it
 
@@ -50,7 +98,8 @@ A GPU gem includes one header, `<gpu_runtime.h>`, and never calls Vulkan itself.
 | Dispatch | `gpu_rt_dispatch` |
 | Sync | `gpu_rt_sync`, `gpu_rt_buffer_sync`, `gpu_rt_pending` |
 
-- `gpu_rt_context_get(mrb)` starts Vulkan the first time it is called, so a program that never uses the GPU never pays for it.
+- `gpu_rt_context_get(mrb)` starts Vulkan the first time it is called, so a program that never uses the GPU never pays for it. The device is chosen there, as [Devices and features](#devices-and-features) describes; a gem does not choose it.
+- `gpu_rt_context_info` fills a `gpu_rt_device_info` with what `GPU.info` reports, including the device's index and its `gpu_rt_device_type`. `gpu_rt_context_has_feature` answers for one `gpu_rt_feature`.
 - A buffer is created with a size in bytes and a usage, and wrapped as a Ruby object at once, so that the GC frees it. `gpu_rt_buffer_get` reads the buffer of a `GPU::NArray` that Ruby passes in.
 - A buffer records a dtype (`float32`, `uint8`, `uint16` or `int32`) and a shape of up to `GPU_RT_MAX_DIMS` (4) dimensions. A description that names neither is one-dimensional float32, with the element count taken from the size. A description with a shape needs no size. A size that disagrees with the shape, or is not a whole number of elements, raises `ArgumentError`. The runtime does not convert or check elements; the gem reads the dtype and shape of a buffer and decides what to do.
 - A pipeline is created from SPIR-V bytes and a layout described by value.
