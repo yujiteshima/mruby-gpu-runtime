@@ -93,7 +93,7 @@ A GPU gem includes one header, `<gpu_runtime.h>`, and never calls Vulkan itself.
 |---|---|
 | Version | `GPU_RT_API_VERSION`, `gpu_rt_require(mrb, major, minor)` |
 | Context (`gpu_rt_context`) | `gpu_rt_context_get`, `gpu_rt_context_ready`, `gpu_rt_context_info`, `gpu_rt_context_has_feature` |
-| Buffers (`gpu_rt_buffer`) | `gpu_rt_buffer_create`, `gpu_rt_buffer_wrap`, `gpu_rt_buffer_release`, `gpu_rt_buffer_get`, `gpu_rt_buffer_check`, `gpu_rt_buffer_size`, `gpu_rt_buffer_map`, `gpu_rt_buffer_unmap` |
+| Buffers (`gpu_rt_buffer`) | `gpu_rt_buffer_create`, `gpu_rt_buffer_wrap`, `gpu_rt_buffer_release`, `gpu_rt_buffer_get`, `gpu_rt_buffer_check`, `gpu_rt_buffer_size`, `gpu_rt_buffer_map`, `gpu_rt_buffer_unmap`, `gpu_rt_buffer_dtype`, `gpu_rt_buffer_ndim`, `gpu_rt_buffer_shape`, `gpu_rt_buffer_count`, `gpu_rt_dtype_size`, `gpu_rt_dtype_name` |
 | Pipelines (`gpu_rt_pipeline`) | `gpu_rt_pipeline_create`, `gpu_rt_pipeline_release` |
 | Dispatch | `gpu_rt_dispatch` |
 | Sync | `gpu_rt_sync`, `gpu_rt_buffer_sync`, `gpu_rt_pending` |
@@ -101,6 +101,7 @@ A GPU gem includes one header, `<gpu_runtime.h>`, and never calls Vulkan itself.
 - `gpu_rt_context_get(mrb)` starts Vulkan the first time it is called, so a program that never uses the GPU never pays for it. The device is chosen there, as [Devices and features](#devices-and-features) describes; a gem does not choose it.
 - `gpu_rt_context_info` fills a `gpu_rt_device_info` with what `GPU.info` reports, including the device's index and its `gpu_rt_device_type`. `gpu_rt_context_has_feature` answers for one `gpu_rt_feature`.
 - A buffer is created with a size in bytes and a usage, and wrapped as a Ruby object at once, so that the GC frees it. `gpu_rt_buffer_get` reads the buffer of a `GPU::NArray` that Ruby passes in.
+- A buffer records a dtype (`float32`, `uint8`, `uint16` or `int32`) and a shape of up to `GPU_RT_MAX_DIMS` (4) dimensions. A description that names neither is one-dimensional float32, with the element count taken from the size. A description with a shape needs no size. A size that disagrees with the shape, or is not a whole number of elements, raises `ArgumentError`. The runtime does not convert or check elements; the gem reads the dtype and shape of a buffer and decides what to do.
 - A pipeline is created from SPIR-V bytes and a layout described by value.
 - `gpu_rt_dispatch` records a dispatch, with a label that names the operation, into the batch that all GPU gems share. Nothing runs until a result is needed: `gpu_rt_buffer_map` waits for the dispatches that touch that buffer, and `gpu_rt_sync` for all of them.
 - Every function takes `mrb` first and raises a Ruby exception when it fails.

@@ -235,7 +235,8 @@ if Object.const_defined?(:GPURuntimeTest)
   a.write([1, 2, 3, 4, 5])
   assert_true("what is written through a mapping is read back", a.read == [1.0, 2.0, 3.0, 4.0, 5.0],
               a.read.inspect)
-  assert_true("a buffer of 3 bytes keeps its size", B.with_usage(3, 1).bytesize == 3)
+  assert_raise_message("3 bytes with no dtype -> ArgumentError: not whole float32 elements",
+                       ArgumentError, "3 bytes", "float32") { B.with_usage(3, 1) }
   e = B.floats(0)
   assert_true("an empty buffer has size 0 and reads as []", e.bytesize == 0 && e.read == [],
               "#{e.bytesize} #{e.read.inspect}")
@@ -247,6 +248,84 @@ if Object.const_defined?(:GPURuntimeTest)
               !T.buffer?("x") && !T.buffer?(nil) && !T.buffer?(1) && !T.buffer?([a]))
   assert_true("gpu_rt_buffer_get reads a buffer passed in from Ruby", T.bytesize_of(a) == 20)
   assert_raise_message("gpu_rt_buffer_get of a String -> TypeError", TypeError, "String") { T.bytesize_of("x") }
+
+  # -- dtype and shape --
+  f32, u8, u16, i32 = 0, 1, 2, 3
+  assert_true("the dtypes, their element sizes, and a value that is not one",
+              T.dtypes == [["float32", 4], ["uint8", 1], ["uint16", 2], ["int32", 4], ["unknown", 0]],
+              T.dtypes.inspect)
+  assert_true("a shape has room for at least 3 dimensions", T.max_dims >= 3, T.max_dims.to_s)
+
+  assert_true("a description with only a size is float32 with one dimension",
+              a.dtype == f32 && a.ndim == 1 && a.shape == [5] && a.count == 5,
+              [a.dtype, a.ndim, a.shape, a.count].inspect)
+  assert_true("an empty buffer has shape [0]", e.shape == [0] && e.count == 0 && e.ndim == 1,
+              e.shape.inspect)
+
+  m = B.typed(f32, [2, 3])
+  assert_true("the size comes from the shape: float32 [2, 3] is 24 bytes",
+              m.bytesize == 24 && m.shape == [2, 3] && m.ndim == 2 && m.count == 6,
+              [m.bytesize, m.shape, m.ndim, m.count].inspect)
+  m.write([1, 2, 3, 4, 5, 6])
+  assert_true("a two-dimensional buffer maps as its elements in row-major order",
+              m.read == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], m.read.inspect)
+  assert_true("a size that agrees with the shape is accepted",
+              B.typed(f32, [2, 3], 24).shape == [2, 3])
+  v = B.typed(u16, [2, 3, 4])
+  assert_true("uint16 [2, 3, 4] is 48 bytes in 3 dimensions",
+              v.bytesize == 48 && v.count == 24 && v.ndim == 3 && v.shape == [2, 3, 4] && v.dtype == u16,
+              [v.bytesize, v.count, v.shape].inspect)
+  w = B.typed(i32, [T.max_dims > 3 ? 2 : 1] + [1] * (T.max_dims - 1))
+  assert_true("a buffer with the most dimensions", w.ndim == T.max_dims && w.shape.size == T.max_dims)
+  assert_true("a zero extent makes an empty buffer and is kept in the shape",
+              B.typed(i32, [3, 0, 2]).shape == [3, 0, 2] && B.typed(i32, [3, 0, 2]).bytesize == 0 &&
+              B.typed(i32, [3, 0, 2]).count == 0)
+  assert_true("a zero extent next to huge ones does not overflow",
+              B.typed(f32, [0xffffffff, 0xffffffff, 0, 0xffffffff]).bytesize == 0) if T.max_dims >= 4
+
+  bytes = B.typed(u8, nil, 3)
+  assert_true("uint8 with only a size: 3 bytes are 3 elements",
+              bytes.bytesize == 3 && bytes.shape == [3] && bytes.count == 3 && bytes.dtype == u8,
+              [bytes.bytesize, bytes.shape].inspect)
+  bytes.write_bytes("\x01\x80\xff")
+  assert_true("uint8 elements are read back", bytes.read_values == [1, 128, 255], bytes.read_values.inspect)
+  words = B.typed(u16, nil, 6).write_bytes("\x01\x00\x00\x01\xff\xff")
+  assert_true("uint16 with only a size: 6 bytes are 3 elements", words.shape == [3], words.shape.inspect)
+  assert_true("int32 with only a size: 8 bytes are 2 elements", B.typed(i32, nil, 8).shape == [2])
+
+  assert_true("gpu_rt_buffer_get reads the dtype and shape of a buffer passed in from Ruby",
+              T.describe(m) == ["float32", [2, 3], 6, 24] && T.describe(v) == ["uint16", [2, 3, 4], 24, 48] &&
+              T.describe(bytes) == ["uint8", [3], 3, 3] && T.describe(a) == ["float32", [5], 5, 20],
+              [T.describe(m), T.describe(v), T.describe(bytes), T.describe(a)].inspect)
+
+  assert_raise_message("a size that disagrees with the shape -> ArgumentError naming both",
+                       ArgumentError, "20 bytes", "[2, 3]", "float32", "24 bytes") { B.typed(f32, [2, 3], 20) }
+  assert_raise_message("a size that is not whole elements -> ArgumentError",
+                       ArgumentError, "5 bytes", "uint16") { B.typed(u16, nil, 5) }
+  assert_raise_message("an empty shape with a size set still has to agree", ArgumentError,
+                       "[0]", "8 bytes") { B.typed(f32, [0], 8) }
+  assert_raise_message("more dimensions than the runtime has -> ArgumentError", ArgumentError,
+                       "#{T.max_dims + 1} dimensions", "at most #{T.max_dims}") do
+    B.typed(f32, [1] * T.max_dims, 0, T.max_dims + 1)
+  end
+  assert_raise_message("a value that is not a dtype -> ArgumentError", ArgumentError,
+                       "#{T.dtypes.size - 1} is not a dtype") { B.typed(T.dtypes.size - 1, [2]) }
+  assert_raise_message("a negative dtype -> ArgumentError", ArgumentError, "not a dtype") { B.typed(-1, [2]) }
+  assert_raise_message("a shape whose bytes overflow -> ArgumentError", ArgumentError,
+                       "int32", "[4294967295, 4294967295, 4294967295]", "size_t") do
+    B.typed(i32, [0xffffffff, 0xffffffff, 0xffffffff])
+  end
+
+  GPU.sync
+  img = B.typed(u8, [3, 3]).write_bytes("\x00\x01\x7f\x80\x81\xfe\xff\x10\x20")
+  wide = T.widen(img)
+  assert_true("a dispatch from a uint8 buffer makes an int32 buffer of the same shape",
+              T.pending == 1 && T.describe(wide) == ["int32", [3, 3], 9, 36], T.describe(wide).inspect)
+  assert_true("the shader reads 9 uint8 elements as words and writes int32",
+              wide.read_values == [-128, -127, -1, 0, 1, 126, 127, -112, -96], wide.read_values.inspect)
+  assert_true("the dispatch leaves its uint8 input alone",
+              img.read_values == [0, 1, 127, 128, 129, 254, 255, 16, 32], img.read_values.inspect)
+  assert_raise_message("a gem can refuse a buffer by its dtype", TypeError, "uint8", "float32") { T.widen(a) }
 
   # -- dispatch into the batch --
   GPU.sync

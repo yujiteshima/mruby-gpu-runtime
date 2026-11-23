@@ -1,0 +1,22 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+// A uint8 buffer, read as 32-bit words: this works on every device, with or
+// without 8-bit storage access, because the memory behind a buffer is always
+// a whole number of words.
+layout(set = 0, binding = 0) readonly buffer BufA { uint a[]; };
+layout(set = 0, binding = 1) buffer BufB { int b[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+// b = int(a) - 128: uint8 in, int32 out, so the result has negative values.
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < pc.n) {
+        uint byte = (a[idx >> 2] >> ((idx & 3u) * 8u)) & 0xffu;
+        b[idx] = int(byte) - 128;
+    }
+}
