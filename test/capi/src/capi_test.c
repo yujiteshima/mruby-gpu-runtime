@@ -459,7 +459,7 @@ static mrb_value t_inc_groups(mrb_state *mrb, mrb_value self) {
 }
 
 /* GPURuntimeTest.create_pipeline(storage_buffers, push_size, spirv_bytes, report)
- *   -> true, or [operation, reason, vk_result] when `report` and it failed.
+ *   -> true, or [operation, reason, vk_result, kind] when `report` and it failed.
  * `spirv_bytes` cuts the inc shader short; 0 means all of it. */
 static mrb_value t_create_pipeline(mrb_state *mrb, mrb_value self) {
   mrb_int bufs, push, bytes;
@@ -467,13 +467,13 @@ static mrb_value t_create_pipeline(mrb_state *mrb, mrb_value self) {
   mrb_get_args(mrb, "iiib", &bufs, &push, &bytes, &report);
   gpu_rt_context *ctx = gpu_rt_context_get(mrb);
   gpu_rt_layout layout = { .storage_buffers = (uint32_t)bufs, .push_constant_size = (uint32_t)push };
-  gpu_rt_error err = { "untouched", "untouched", 12345 };
+  gpu_rt_error err = { "untouched", "untouched", 12345, GPU_RT_ERROR_SHAPE };
   gpu_rt_pipeline *p = gpu_rt_pipeline_create(mrb, ctx, inc_spv,
                                               bytes ? (size_t)bytes : sizeof(inc_spv),
                                               &layout, "probe", report ? &err : NULL);
   if (p) {
     gpu_rt_pipeline_release(mrb, p);
-    if (report && (err.operation || err.reason || err.vk_result)) {
+    if (report && (err.operation || err.reason || err.vk_result || err.kind)) {
       mrb_raise(mrb, E_RUNTIME_ERROR, "error_out was not zeroed on success");
     }
     return mrb_true_value();
@@ -482,7 +482,42 @@ static mrb_value t_create_pipeline(mrb_state *mrb, mrb_value self) {
   mrb_ary_push(mrb, v, mrb_str_new_cstr(mrb, err.operation));
   mrb_ary_push(mrb, v, mrb_str_new_cstr(mrb, err.reason));
   mrb_ary_push(mrb, v, mrb_fixnum_value(err.vk_result));
+  mrb_ary_push(mrb, v, mrb_fixnum_value((mrb_int)err.kind));
   return v;
+}
+
+/* ---- errors ---- */
+
+/* GPURuntimeTest.error_kinds -> { generic: 0, device: 1, ... , count: n } */
+static mrb_value t_error_kinds(mrb_state *mrb, mrb_value self) {
+  mrb_value h = mrb_hash_new(mrb);
+#define KIND(name, value) \
+  mrb_hash_set(mrb, h, mrb_symbol_value(mrb_intern_lit(mrb, name)), mrb_fixnum_value(value))
+  KIND("generic", GPU_RT_ERROR_GENERIC);
+  KIND("device", GPU_RT_ERROR_DEVICE);
+  KIND("out_of_memory", GPU_RT_ERROR_OUT_OF_MEMORY);
+  KIND("unsupported", GPU_RT_ERROR_UNSUPPORTED);
+  KIND("compile", GPU_RT_ERROR_COMPILE);
+  KIND("shape", GPU_RT_ERROR_SHAPE);
+  KIND("count", GPU_RT_ERROR_KIND_COUNT);
+#undef KIND
+  return h;
+}
+
+/* GPURuntimeTest.error_class(kind) -> the class gpu_rt_error_class returns */
+static mrb_value t_error_class(mrb_state *mrb, mrb_value self) {
+  mrb_int kind;
+  mrb_get_args(mrb, "i", &kind);
+  return mrb_obj_value(gpu_rt_error_class(mrb, (gpu_rt_error_kind)kind));
+}
+
+/* GPURuntimeTest.raise_error(kind, a, b): raises the way a gem does */
+static mrb_value t_raise_error(mrb_state *mrb, mrb_value self) {
+  mrb_int kind, a, b;
+  mrb_get_args(mrb, "iii", &kind, &a, &b);
+  mrb_raisef(mrb, gpu_rt_error_class(mrb, (gpu_rt_error_kind)kind),
+             "shape mismatch: %d vs %d", (int)a, (int)b);
+  return mrb_nil_value();   /* not reached */
 }
 
 void mrb_mruby_gpu_runtime_capi_test_gem_init(mrb_state *mrb) {
@@ -504,6 +539,9 @@ void mrb_mruby_gpu_runtime_capi_test_gem_init(mrb_state *mrb) {
   mrb_define_module_function(mrb, t, "inc_and_release", t_inc_and_release, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, t, "inc_groups", t_inc_groups, MRB_ARGS_REQ(2));
   mrb_define_module_function(mrb, t, "create_pipeline", t_create_pipeline, MRB_ARGS_REQ(4));
+  mrb_define_module_function(mrb, t, "error_kinds", t_error_kinds, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, t, "error_class", t_error_class, MRB_ARGS_REQ(1));
+  mrb_define_module_function(mrb, t, "raise_error", t_raise_error, MRB_ARGS_REQ(3));
   mrb_define_module_function(mrb, t, "describe", t_describe, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, t, "dtypes", t_dtypes, MRB_ARGS_NONE());
   mrb_define_module_function(mrb, t, "max_dims", t_max_dims, MRB_ARGS_NONE());

@@ -97,10 +97,10 @@ static mrb_value gpu_s_devices(mrb_state *mrb, mrb_value self) {
  * (equal ignoring case, or else contained in the device's name), or nil for
  * the default again (MRUBY_GPU_DEVICE, or the first device that is not a
  * CPU). Call it before the first GPU operation. Once the device has started
- * only the device in use is accepted, and anything else raises RuntimeError.
+ * only the device in use is accepted, and anything else raises GPU::Error.
  * Raises ArgumentError, with the list of devices, when none matches, and an
- * earlier choice then stays. nil raises RuntimeError when MRUBY_GPU_DEVICE
- * matches no device. */
+ * earlier choice then stays. nil raises GPU::DeviceError when
+ * MRUBY_GPU_DEVICE matches no device. */
 static mrb_value gpu_s_set_device(mrb_state *mrb, mrb_value self) {
   mrb_value v;
   mrb_get_args(mrb, "o", &v);
@@ -167,6 +167,15 @@ void mrb_mruby_gpu_runtime_gem_init(mrb_state *mrb) {
   mrb_define_module_function(mrb, gpu, "sync_mode=",  gpu_s_set_sync_mode, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, gpu, "devices",     gpu_s_devices,     MRB_ARGS_NONE());
   mrb_define_module_function(mrb, gpu, "device=",     gpu_s_set_device,  MRB_ARGS_REQ(1));
+
+  /* The exception classes of every GPU gem (gpu_runtime.h, "Errors"). Defined
+   * here so that they exist before the gems that raise them are initialised. */
+  struct RClass *error = mrb_define_class_under(mrb, gpu, "Error", E_STANDARD_ERROR);
+  mrb_define_class_under(mrb, gpu, "DeviceError",      error);
+  mrb_define_class_under(mrb, gpu, "OutOfMemoryError", error);
+  mrb_define_class_under(mrb, gpu, "UnsupportedError", error);
+  mrb_define_class_under(mrb, gpu, "CompileError",     error);
+  mrb_define_class_under(mrb, gpu, "ShapeError",       E_ARGUMENT_ERROR);
 }
 
 void mrb_mruby_gpu_runtime_gem_final(mrb_state *mrb) {

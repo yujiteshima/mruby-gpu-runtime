@@ -92,9 +92,9 @@ if env && !(env_is_index ? env.to_i < devices.size
                          : devices.any? { |d| d[:name].downcase.include?(env.downcase) })
   # The person running this named a device that is not here. Check the error,
   # then run the rest on a device chosen in the script, which wins.
-  assert_raise_with("MRUBY_GPU_DEVICE that matches no device -> RuntimeError", RuntimeError,
+  assert_raise_with("MRUBY_GPU_DEVICE that matches no device -> GPU::DeviceError", GPU::DeviceError,
                     "MRUBY_GPU_DEVICE", env, devices[0][:name]) { GPU.device = nil }
-  assert_raise_with("and the same when the device starts", RuntimeError, "MRUBY_GPU_DEVICE") { GPU.info }
+  assert_raise_with("and the same when the device starts", GPU::DeviceError, "MRUBY_GPU_DEVICE") { GPU.info }
   assert_true("a failed start can be followed by a choice", (GPU.device = 0) == 0)
   env = nil
   default_fails = true
@@ -128,16 +128,16 @@ assert_true("GPU.info names the device GPU.devices lists at :device_index",
 assert_true("the device in use can be chosen again, by index and by name",
             (GPU.device = info[:device_index]) && (GPU.device = info[:device]))
 if default_fails
-  assert_raise_with("nil after the start, with MRUBY_GPU_DEVICE matching nothing -> RuntimeError",
-                    RuntimeError, "MRUBY_GPU_DEVICE") { GPU.device = nil }
+  assert_raise_with("nil after the start, with MRUBY_GPU_DEVICE matching nothing -> GPU::DeviceError",
+                    GPU::DeviceError, "MRUBY_GPU_DEVICE") { GPU.device = nil }
 else
   assert_true("and by nil, when it is the default", (GPU.device = nil).nil?)
 end
 other = devices.find { |d| d[:index] != info[:device_index] && d[:name] != info[:device] }
 if other
-  assert_raise_with("another device, after the start -> RuntimeError", RuntimeError,
+  assert_raise_with("another device, after the start -> GPU::Error", GPU::Error,
                     "already started", info[:device]) { GPU.device = other[:index] }
-  assert_raise_with("and by name", RuntimeError, "already started") { GPU.device = other[:name] }
+  assert_raise_with("and by name", GPU::Error, "already started") { GPU.device = other[:name] }
 else
   puts "NOTE  one device here: refusing another device after the start is not tested"
 end
@@ -181,6 +181,21 @@ assert_true("sync_mode reports :deferred again", GPU.sync_mode == :deferred, GPU
 assert_raise("unknown sync mode -> ArgumentError", ArgumentError) { GPU.sync_mode = :later }
 assert_true("a rejected mode leaves the mode unchanged", GPU.sync_mode == :deferred,
             GPU.sync_mode.inspect)
+
+# ---- the exception classes ----
+assert_true("GPU::Error is a StandardError", GPU::Error.superclass == StandardError,
+            GPU::Error.superclass.inspect)
+[GPU::DeviceError, GPU::OutOfMemoryError, GPU::UnsupportedError, GPU::CompileError].each do |c|
+  assert_true("#{c} is a GPU::Error", c.superclass == GPU::Error, c.superclass.inspect)
+end
+assert_true("GPU::ShapeError is an ArgumentError", GPU::ShapeError.superclass == ArgumentError,
+            GPU::ShapeError.superclass.inspect)
+assert_raise("rescue GPU::Error catches a subclass", GPU::Error) { raise GPU::DeviceError, "lost" }
+assert_raise("rescue StandardError catches GPU::Error", StandardError) { raise GPU::Error, "x" }
+assert_true("a GPU::Error is not a RuntimeError or an ArgumentError",
+            !(GPU::Error <= RuntimeError) && !(GPU::Error <= ArgumentError))
+assert_true("a bad argument is not a GPU::Error",
+            begin; GPU.sync_mode = :later; rescue GPU::Error; false; rescue ArgumentError; true; end)
 
 # ---- the C API, through test/capi ----
 if Object.const_defined?(:GPURuntimeTest)
@@ -389,11 +404,40 @@ if Object.const_defined?(:GPURuntimeTest)
                        "storage buffers") { T.create_pipeline(4, 4, 0, true) }
   assert_raise_message("more push constants than the runtime has -> ArgumentError", ArgumentError,
                        "push constants") { T.create_pipeline(1, 20, 0, false) }
-  assert_raise_message("SPIR-V that is not whole words -> RuntimeError naming the pipeline",
-                       RuntimeError, "probe", "SPIR-V", "VkResult") { T.create_pipeline(1, 4, 13, false) }
+  assert_raise_message("SPIR-V that is not whole words -> GPU::CompileError naming the pipeline",
+                       GPU::CompileError, "probe", "SPIR-V", "VkResult") { T.create_pipeline(1, 4, 13, false) }
   rep = T.create_pipeline(1, 4, 13, true)
   assert_true("the same, reported through error_out", rep.is_a?(Array) && rep[0].include?("SPIR-V") &&
               rep[1].is_a?(String) && rep[2] == 0, rep.inspect)
+  assert_true("error_out carries the kind, and it is the class that was raised",
+              T.error_class(rep[3]) == GPU::CompileError, rep.inspect)
+
+  # -- errors --
+  kinds = T.error_kinds
+  { generic: GPU::Error, device: GPU::DeviceError, out_of_memory: GPU::OutOfMemoryError,
+    unsupported: GPU::UnsupportedError, compile: GPU::CompileError, shape: GPU::ShapeError }.each do |k, c|
+    assert_true("gpu_rt_error_class(#{k}) is #{c}", T.error_class(kinds[k]) == c,
+                T.error_class(kinds[k]).inspect)
+  end
+  assert_true("an unknown kind is GPU::Error",
+              T.error_class(kinds[:count]) == GPU::Error && T.error_class(-1) == GPU::Error)
+  assert_raise_message("a gem raises GPU::ShapeError through gpu_rt_error_class", GPU::ShapeError,
+                       "shape mismatch: 3 vs 4") { T.raise_error(kinds[:shape], 3, 4) }
+  assert_raise("and rescue ArgumentError still catches it", ArgumentError) { T.raise_error(kinds[:shape], 3, 4) }
+  assert_raise("a gem raises GPU::UnsupportedError, caught as GPU::Error", GPU::Error) do
+    T.raise_error(kinds[:unsupported], 0, 0)
+  end
+
+  # A buffer no device can provide: 2**50 bytes is past any address space, and
+  # small enough that no driver's size arithmetic wraps around. As a matrix,
+  # because one dimension holds less than that: the description is a valid
+  # one, and it is the device that refuses.
+  assert_raise_message("a buffer the device cannot provide -> GPU::OutOfMemoryError",
+                       GPU::OutOfMemoryError, "creating a buffer of #{1 << 50} bytes", "failed",
+                       "VkResult -") do
+    B.typed(0, [1 << 20, 1 << 28])   # float32
+  end
+  assert_true("and the device works after it", B.floats(2).write([1, 2]).read == [1.0, 2.0])
 
   # -- dispatches that do not fit the pipeline --
   GPU.sync

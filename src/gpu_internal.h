@@ -108,6 +108,18 @@ void gpu_check(mrb_state *mrb, VkResult r, const char *call);
 const char *gpu_result_name(VkResult r);
 #define VK_CHECK(mrb, expr) gpu_check((mrb), (expr), #expr)
 
+/* The exception class a VkResult stands for (the table in README.md,
+ * "Errors"). GPU_RT_ERROR_GENERIC for a result the table does not list. */
+gpu_rt_error_kind gpu_result_kind(VkResult r);
+
+/* gpu_check for a call made on behalf of a named operation: raises the class
+ * of `r` with "<operation>: <call> failed: <reason> (VkResult <n>)". Does
+ * not return. `operation` may be NULL. */
+void gpu_fail(mrb_state *mrb, VkResult r, const char *call, const char *operation);
+
+/* Raise GPU::Error or one of its subclasses with a fixed message. */
+#define GPU_RAISE(mrb, kind, msg) mrb_raise((mrb), gpu_rt_error_class((mrb), (kind)), (msg))
+
 /* ---- gpu_vulkan.c ---- */
 
 /* Create the instance, device, queue, command pool, descriptor layouts and
@@ -136,8 +148,10 @@ const char *gpu_device_type_name(VkPhysicalDeviceType type);
 
 /* GPU.device=. Exactly one of the three says which device: `index` when
  * `by_index`, else `name` (matched as README.md describes), else NULL for
- * the default. Raises ArgumentError when no device matches, and RuntimeError
- * when the device has started and the choice is another one. */
+ * the default. Raises ArgumentError when no device matches, GPU::Error
+ * when the device has started and the choice is another one, and
+ * GPU::DeviceError when the default is an MRUBY_GPU_DEVICE that matches
+ * nothing. */
 void gpu_device_choose(mrb_state *mrb, int by_index, mrb_int index, const char *name);
 
 /* gpu_init unless it has already run. Every entry point that needs the device
@@ -158,11 +172,13 @@ VkResult gpu_create_pipeline(const uint32_t *code, size_t size, LayoutId lid,
 
 /* Record one compute dispatch of `pipeline` (created against
  * g_ctx.pipe_layouts[lid]) over `bufs`, in binding order. Nothing is submitted
- * here unless GPU.sync_mode is :eager; see gpu_flush. */
+ * here unless GPU.sync_mode is :eager; see gpu_flush. `label` names the
+ * operation in the message of a Vulkan failure, and may be NULL. */
 void dispatch_pipeline(mrb_state *mrb, VkPipeline pipeline, LayoutId lid,
                        GpuBuffer **bufs, int num_buffers,
                        const void *push_data, uint32_t push_size,
-                       uint32_t group_x, uint32_t group_y, uint32_t group_z);
+                       uint32_t group_x, uint32_t group_y, uint32_t group_z,
+                       const char *label);
 
 /* Submit everything recorded so far, wait for it, and reset for the next batch.
  * Also frees buffers parked in the graveyard. Safe to call with nothing
