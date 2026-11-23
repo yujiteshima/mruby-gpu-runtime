@@ -47,11 +47,18 @@ GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t u
   buf->usage = usage;
   buf->buffer = VK_NULL_HANDLE;
   buf->memory = VK_NULL_HANDLE;
-  buf->bytes = size;
+  /* Whole 32-bit words, so that a shader can read a uint8 or uint16 buffer as
+   * uint[] on a device without 8-bit or 16-bit storage access. */
+  buf->bytes = (size + 3) & ~(VkDeviceSize)3;
   buf->epoch = 0;   /* never bound; no batch can be waiting on it */
   if (buf->bytes == 0) buf->bytes = sizeof(float); /* avoid zero-size allocation */
   char op[64];   /* the operation, for the message of a failure below */
   snprintf(op, sizeof(op), "creating a buffer of %llu bytes", (unsigned long long)size);
+  buf->dtype = GPU_RT_DTYPE_FLOAT32;
+  buf->ndim = 1;
+  buf->count = (size_t)(size / sizeof(float));
+  buf->shape[0] = (uint32_t)buf->count;
+  for (int i = 1; i < GPU_RT_MAX_DIMS; i++) buf->shape[i] = 0;
 
   VkBufferCreateInfo bi = {
     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,

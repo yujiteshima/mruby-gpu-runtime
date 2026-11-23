@@ -33,10 +33,14 @@ typedef enum { LAYOUT_3BUF = 0, LAYOUT_2BUF, LAYOUT_1BUF, LAYOUT_COUNT } LayoutI
 typedef struct gpu_rt_buffer {
   VkBuffer buffer;
   VkDeviceMemory memory;
-  VkDeviceSize bytes;  /* bytes allocated and bound: size, or 4 when size is 0 */
+  VkDeviceSize bytes;  /* bytes allocated and bound: size rounded up to 4, or 4 when size is 0 */
   uint32_t epoch;      /* batch this buffer was last bound in (0 = never); see dispatch_pipeline */
   VkDeviceSize size;   /* bytes the creator asked for */
   uint32_t usage;      /* GPU_RT_BUFFER_* bits */
+  gpu_rt_dtype dtype;  /* element type */
+  uint32_t ndim;       /* 1 .. GPU_RT_MAX_DIMS */
+  uint32_t shape[GPU_RT_MAX_DIMS];  /* extents; 0 past ndim */
+  size_t count;        /* elements: the product of the extents, size / element size */
 } GpuBuffer;
 
 /* The data type of every Ruby object that owns a GpuBuffer (GPU::NArray and
@@ -187,7 +191,9 @@ void gpu_sync_buffer(mrb_state *mrb, GpuBuffer *buf);
 
 /* ---- gpu_buffer.c ---- */
 
-/* Create a buffer of `size` bytes. Raises on failure. */
+/* Create a buffer of `size` bytes: float32, one dimension of size / 4
+ * elements. gpu_rt_buffer_create sets another dtype and shape afterwards.
+ * Raises on failure. */
 GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t usage);
 void       destroy_buffer(mrb_state *mrb, GpuBuffer *buf);  /* GC finalizer + gpu_rt_buffer_release */
 mrb_value  wrap_buffer(mrb_state *mrb, struct RClass *klass, GpuBuffer *buf);

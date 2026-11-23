@@ -190,12 +190,59 @@ mrb_bool gpu_rt_context_has_feature(mrb_state *mrb, gpu_rt_context *ctx, gpu_rt_
 /* How a buffer may be used; OR them together. */
 #define GPU_RT_BUFFER_STORAGE (1u << 0)   /* bound to a pipeline as a storage buffer */
 
+/* What one element of a buffer is. The runtime records it and does not
+ * convert: the bytes are the host's, in host byte order, and the shader that
+ * a gem dispatches must read them the same way.
+ *
+ *   dtype                  bytes per element (gpu_rt_dtype_size)
+ *   GPU_RT_DTYPE_FLOAT32   4
+ *   GPU_RT_DTYPE_UINT8     1
+ *   GPU_RT_DTYPE_UINT16    2
+ *   GPU_RT_DTYPE_INT32     4
+ *
+ * FLOAT32 is 0, so a description that does not name a dtype is float32. */
+typedef enum gpu_rt_dtype {
+  GPU_RT_DTYPE_FLOAT32 = 0,
+  GPU_RT_DTYPE_UINT8,
+  GPU_RT_DTYPE_UINT16,
+  GPU_RT_DTYPE_INT32,
+  GPU_RT_DTYPE_COUNT
+} gpu_rt_dtype;
+
+/* The most dimensions a buffer's shape may have. */
+#define GPU_RT_MAX_DIMS 4
+
 typedef struct gpu_rt_buffer_desc {
   size_t   size;    /* in bytes; 0 is allowed and makes an empty buffer */
   uint32_t usage;   /* GPU_RT_BUFFER_* bits, at least one */
-  /* A dtype and a shape join this struct with runtime#4. Left at zero they
-   * will mean what every buffer is today: float32, one dimension. */
+  gpu_rt_dtype dtype;                /* 0 is GPU_RT_DTYPE_FLOAT32 */
+  uint32_t ndim;                     /* dimensions, 0 .. GPU_RT_MAX_DIMS; 0 means one
+                                      * dimension whose extent comes from `size` */
+  uint32_t shape[GPU_RT_MAX_DIMS];   /* the extent of each of the `ndim` dimensions,
+                                      * outermost first (row-major); 0 is allowed */
 } gpu_rt_buffer_desc;
+
+/* How `size` and the shape relate. A buffer always holds a whole number of
+ * elements: gpu_rt_buffer_size() == gpu_rt_buffer_count() * gpu_rt_dtype_size().
+ *
+ *  - `ndim` is 0: the buffer has one dimension of `size` / element size
+ *    elements. So { .size = n * sizeof(float), .usage = ... } is n float32,
+ *    as it was before buffers had a dtype.
+ *  - `ndim` is not 0 and `size` is 0: the size is the product of the extents
+ *    times the element size. This is the form to prefer.
+ *  - both are given: they must agree.
+ *
+ * gpu_rt_buffer_create() raises ArgumentError when `size` is not a whole
+ * number of elements, when `size` and the shape disagree, when the product
+ * does not fit in a size_t, for more than GPU_RT_MAX_DIMS dimensions, and for
+ * an unknown dtype. An extent of the description past `ndim` is ignored.
+ *
+ * The memory behind a buffer is a whole number of 32-bit words, whatever the
+ * dtype. A shader for a device without 8-bit or 16-bit storage access
+ * (GPU_RT_FEATURE_STORAGE_8BIT) can therefore declare a uint8 or uint16
+ * buffer as `uint data[]` and unpack the elements itself. The bytes between
+ * gpu_rt_buffer_size() and the next multiple of 4 are undefined, can be
+ * written through the mapping, and no element lives there. */
 
 /* Create a buffer. Its contents are undefined until written. The host can
  * always map it. Raises ArgumentError for a bad description and
@@ -228,7 +275,8 @@ void gpu_rt_buffer_release(mrb_state *mrb, gpu_rt_buffer *buf);
 gpu_rt_buffer *gpu_rt_buffer_get(mrb_state *mrb, mrb_value obj);
 gpu_rt_buffer *gpu_rt_buffer_check(mrb_state *mrb, mrb_value obj);
 
-/* The size in bytes the buffer was created with. */
+/* The size in bytes: what the buffer was created with, or what its shape
+ * and dtype come to. */
 size_t gpu_rt_buffer_size(mrb_state *mrb, gpu_rt_buffer *buf);
 
 /* Map the buffer into host memory, for reading and writing gpu_rt_buffer_size()
@@ -239,6 +287,37 @@ size_t gpu_rt_buffer_size(mrb_state *mrb, gpu_rt_buffer *buf);
  * buffer must not be dereferenced. */
 void *gpu_rt_buffer_map(mrb_state *mrb, gpu_rt_buffer *buf);
 void  gpu_rt_buffer_unmap(mrb_state *mrb, gpu_rt_buffer *buf);
+
+/* ---- Dtype and shape of a buffer ----
+ *
+ * What the buffer was created with, for any buffer: one the gem created, or
+ * one passed in from Ruby and read with gpu_rt_buffer_get() or
+ * gpu_rt_buffer_check(). They are fixed for the life of the buffer. None of
+ * these functions raises, waits for the batch or starts the device. */
+
+/* The element type. */
+gpu_rt_dtype gpu_rt_buffer_dtype(mrb_state *mrb, gpu_rt_buffer *buf);
+
+/* The number of dimensions, 1 .. GPU_RT_MAX_DIMS. */
+uint32_t gpu_rt_buffer_ndim(mrb_state *mrb, gpu_rt_buffer *buf);
+
+/* Copy the shape into `shape_out`, which has room for GPU_RT_MAX_DIMS
+ * extents: the first gpu_rt_buffer_ndim() are the buffer's, outermost first,
+ * and the rest are set to 0. */
+void gpu_rt_buffer_shape(mrb_state *mrb, gpu_rt_buffer *buf,
+                         uint32_t shape_out[GPU_RT_MAX_DIMS]);
+
+/* The number of elements: the product of the extents. */
+size_t gpu_rt_buffer_count(mrb_state *mrb, gpu_rt_buffer *buf);
+
+/* The bytes one element of `dtype` takes, or 0 for a value that is not a
+ * dtype. */
+size_t gpu_rt_dtype_size(mrb_state *mrb, gpu_rt_dtype dtype);
+
+/* The name of `dtype` for messages and for Ruby ("float32", "uint8",
+ * "uint16", "int32"), or "unknown" for a value that is not a dtype. The
+ * string belongs to the runtime. */
+const char *gpu_rt_dtype_name(mrb_state *mrb, gpu_rt_dtype dtype);
 
 /* ---- Pipelines ---- */
 
