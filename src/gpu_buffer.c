@@ -60,10 +60,14 @@ GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t u
   buf->shape[0] = (uint32_t)buf->count;
   for (int i = 1; i < GPU_RT_MAX_DIMS; i++) buf->shape[i] = 0;
 
+  VkBufferUsageFlags vk_usage = 0;
+  if (usage & GPU_RT_BUFFER_STORAGE) vk_usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  if (usage & GPU_RT_BUFFER_UNIFORM) vk_usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+
   VkBufferCreateInfo bi = {
     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
     .size = buf->bytes,
-    .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    .usage = vk_usage,
     .sharingMode = VK_SHARING_MODE_EXCLUSIVE
   };
   VkResult r = vkCreateBuffer(g_ctx.device, &bi, NULL, &buf->buffer);
@@ -95,7 +99,7 @@ GpuBuffer *gpu_buffer_create_bytes(mrb_state *mrb, VkDeviceSize size, uint32_t u
     vkDestroyBuffer(g_ctx.device, buf->buffer, NULL);
     mrb_free(mrb, buf);
     GPU_RAISE(mrb, GPU_RT_ERROR_UNSUPPORTED,
-      "no host-visible, host-coherent memory type is available for a storage buffer");
+      "no host-visible, host-coherent memory type is available for a buffer");
   }
 
   VkMemoryAllocateInfo ai = {

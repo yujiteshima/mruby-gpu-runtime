@@ -400,10 +400,37 @@ if Object.const_defined?(:GPURuntimeTest)
   assert_raise_message("a layout of 0 buffers -> ArgumentError", ArgumentError, "probe", "storage buffers") do
     T.create_pipeline(0, 4, 0, false)
   end
-  assert_raise_message("a layout of 4 buffers -> ArgumentError, also when reporting", ArgumentError,
-                       "storage buffers") { T.create_pipeline(4, 4, 0, true) }
-  assert_raise_message("more push constants than the runtime has -> ArgumentError", ArgumentError,
-                       "push constants") { T.create_pipeline(1, 20, 0, false) }
+  # What a layout may ask for is the device's limit, so the tests read it.
+  lim = T.limits
+  assert_true("gpu_rt_context_limits reports at least what Vulkan guarantees",
+              lim[:max_storage_buffers] >= 4 && lim[:max_uniform_buffers] >= 12 &&
+              lim[:max_push_constant_size] >= 128 && lim[:max_uniform_buffer_size] >= 16384,
+              lim.inspect)
+  puts "limits: #{lim.inspect}"
+  if lim[:max_storage_buffers] < 0xffffffff
+    assert_raise_message("more storage buffers than the device has -> ArgumentError, also when reporting",
+                         ArgumentError, "storage buffers", lim[:max_storage_buffers].to_s) do
+      T.create_pipeline(lim[:max_storage_buffers] + 1, 4, 0, true)
+    end
+  end
+  if lim[:max_push_constant_size] < 0xfffffffc
+    assert_raise_message("more push constants than the device has -> ArgumentError", ArgumentError,
+                         "push constants", lim[:max_push_constant_size].to_s) do
+      T.create_pipeline(1, lim[:max_push_constant_size] + 4, 0, false)
+    end
+  end
+  if lim[:max_uniform_buffers] < 0xffffffff
+    assert_raise_message("more uniform buffers than the device has -> ArgumentError", ArgumentError,
+                         "uniform buffers", lim[:max_uniform_buffers].to_s) do
+      T.create_pipeline(1, 4, 0, false, lim[:max_uniform_buffers] + 1)
+    end
+  end
+  assert_raise_message("push constants that are not whole words -> ArgumentError", ArgumentError,
+                       "push constants", "multiple of 4") { T.create_pipeline(1, 6, 0, false) }
+  assert_true("layouts the three fixed ones did not have: 4 buffers, 20 bytes, a uniform buffer",
+              T.create_pipeline(4, 4, 0, false) && T.create_pipeline(1, 20, 0, false) &&
+              T.create_pipeline(1, 4, 0, true, 1))
+  assert_true("a layout with no push constants", T.ones(B.floats(300)).read == [1.0] * 300)
   assert_raise_message("SPIR-V that is not whole words -> GPU::CompileError naming the pipeline",
                        GPU::CompileError, "probe", "SPIR-V", "VkResult") { T.create_pipeline(1, 4, 13, false) }
   rep = T.create_pipeline(1, 4, 13, true)
@@ -451,6 +478,137 @@ if Object.const_defined?(:GPURuntimeTest)
                        "workgroups") { T.inc_groups(a, info[:max_workgroups] + 1) } if info[:max_workgroups] < 0xffffffff
   assert_true("a refused dispatch records nothing", T.pending == 0, "pending = #{T.pending}")
   assert_true("and leaves its inputs alone", a.read == [1.0, 2.0, 3.0, 4.0, 5.0], a.read.inspect)
+
+  # -- a layout with four storage buffers, a uniform buffer and 32 bytes of push constants --
+  GPU.sync
+  x = B.floats(5).write([1, 2, 3, 4, 5])
+  y = B.floats(5).write([10, 20, 30, 40, 50])
+  zz = B.floats(5).write([100, 200, 300, 400, 500])
+  w = B.with_usage(16, 2).write([1, 0.5, 0.25, 2])        # GPU_RT_BUFFER_UNIFORM
+  # (x + y/2 + zz/4 + 2) * 2 + offsets[i % 4]
+  o = T.blend(x, y, zz, w, 2.0, [0, 1000, 2000, 3000])
+  assert_true("a dispatch with a uniform buffer is recorded like any other", T.pending == 1,
+              "pending = #{T.pending}")
+  assert_true("4 storage buffers, a uniform buffer and 32 bytes of push constants",
+              o.read == [66.0, 1128.0, 2190.0, 3252.0, 314.0], o.read.inspect)
+  o1 = T.blend(x, y, zz, w, 1.0, [0, 0, 0, 0])            # 33 64 95 126 157
+  assert_true("the next dispatch is pending", T.pending == 1, "pending = #{T.pending}")
+  w.write([0, 0, 1, 0])                                   # mapping a bound uniform buffer runs the batch
+  assert_true("writing a uniform buffer waits for the dispatch that reads it", T.pending == 0,
+              "pending = #{T.pending}")
+  o2 = T.blend(x, y, zz, w, 1.0, [0, 0, 0, 0])            # zz
+  assert_true("each dispatch saw the uniform buffer as it was when recorded",
+              o1.read == [33.0, 64.0, 95.0, 126.0, 157.0] &&
+              o2.read == [100.0, 200.0, 300.0, 400.0, 500.0], "#{o1.read.inspect} #{o2.read.inspect}")
+  both = B.with_usage(16, 3).write([1, 1, 1, 0])          # storage and uniform
+  assert_true("a buffer with both usages binds as either",
+              T.blend(both, both, both, both, 1.0, [0, 0, 0, 0]).read == [3.0, 3.0, 3.0, 0.0])
+  GPU.sync
+  assert_raise_message("no uniform buffer for a layout that has one -> ArgumentError", ArgumentError,
+                       "blend", "0 uniform buffers", "binds 1") { T.blend(x, y, zz, w, 1.0, [0, 0, 0, 0], 0) }
+  assert_raise_message("a missing uniform buffer -> ArgumentError naming the binding", ArgumentError,
+                       "binding 4") { T.blend(x, y, zz, nil, 1.0, [0, 0, 0, 0]) }
+  assert_raise_message("a storage buffer as the uniform buffer -> ArgumentError", ArgumentError,
+                       "binding 4", "GPU_RT_BUFFER_UNIFORM") { T.blend(x, y, zz, x, 1.0, [0, 0, 0, 0]) }
+  assert_raise_message("a uniform buffer as a storage buffer -> ArgumentError", ArgumentError,
+                       "binding 2", "GPU_RT_BUFFER_STORAGE") { T.blend(x, y, w, w, 1.0, [0, 0, 0, 0]) }
+  assert_true("a refused dispatch with a uniform buffer records nothing", T.pending == 0)
+  w.write([1, 0, 0, 1])                                   # acc + 1
+  acc4 = B.floats(4).write([0, 0, 0, 0])
+  600.times { acc4 = T.blend(acc4, acc4, acc4, w, 1.0, [0, 0, 0, 0]) }
+  assert_true("600 chained dispatches of the wider layout, more than the descriptor pool holds",
+              acc4.read == [600.0, 600.0, 600.0, 600.0], acc4.read.inspect)
+  # A batch carries at most 4096 bytes of push constants (GPU_BATCH_PUSH_BYTES in
+  # src/gpu_internal.h): Mesa V3DV writes outside its buffer beyond that, when the
+  # shader indexes its push constants as blend does. 128 dispatches of blend's 32
+  # bytes fill a batch, so the 129th starts a new one.
+  GPU.sync
+  acc4 = B.floats(4).write([0, 0, 0, 0])
+  128.times { acc4 = T.blend(acc4, acc4, acc4, w, 1.0, [0, 0, 0, 0]) }
+  assert_true("128 dispatches with 32 bytes of push constants wait in one batch",
+              T.pending == 128, "pending = #{T.pending}")
+  acc4 = T.blend(acc4, acc4, acc4, w, 1.0, [0, 0, 0, 0])
+  assert_true("the 129th runs them first: a batch carries 4096 bytes of push constants",
+              T.pending == 1, "pending = #{T.pending}")
+  assert_true("and no dispatch is lost at that point", acc4.read == [129.0, 129.0, 129.0, 129.0],
+              acc4.read.inspect)
+  # The 8 bytes of axpy below, { n = 4, s = 1.0 }, are also how blend's 32 bytes start, and
+  # the rest of blend's block is zero. V3DV ignores a block that repeats what it holds, so the
+  # runtime pushes a block that grows twice (dispatch_pipeline). Without that, blend reads stale
+  # offsets here on V3DV.
+  s8 = B.floats(4).write([0, 0, 0, 0])
+  one4 = B.floats(4).write([1, 1, 1, 1])
+  3.times { s8 = T.axpy(s8, one4, 1.0) }                  # 8 bytes each
+  126.times { acc4 = T.blend(acc4, acc4, acc4, w, 1.0, [0, 0, 0, 0]) }
+  # Counted as V3DV places the blocks: 8 + 8 after the first, 126 * 32, and 32 more for the last.
+  assert_true("blocks of 8 bytes, then of 32: 3 and 126 of them fit in one batch",
+              T.pending == 129, "pending = #{T.pending}")
+  acc4 = T.blend(acc4, acc4, acc4, w, 1.0, [0, 0, 0, 0])
+  assert_true("and the next 32 bytes do not", T.pending == 1 && s8.read == [3.0, 3.0, 3.0, 3.0] &&
+              acc4.read == [256.0, 256.0, 256.0, 256.0], "#{T.pending} #{acc4.read.inspect}")
+  assert_true("the three-buffer layout still works next to it",
+              T.axpy(x, y, 2.0).read == [12.0, 24.0, 36.0, 48.0, 60.0])
+
+  # -- the pipeline cache --
+  P = GPURuntimeTest::Pipeline
+  GPU.sync
+  T.inc(B.floats(1).write([0])).read       # the test gem's own inc pipeline exists: 1 buffer, 4 bytes
+  count = T.pipeline_count
+  p1 = P.inc(1, 4, "first")
+  p2 = P.inc(1, 4, "second")
+  assert_true("the same SPIR-V with the same layout is not compiled again",
+              T.pipeline_count == count, "#{T.pipeline_count} pipelines, #{count} before")
+  q1 = P.inc(1, 8)
+  assert_true("the same SPIR-V with another push-constant size is another pipeline",
+              T.pipeline_count == count + 1, "#{T.pipeline_count} pipelines, #{count} before")
+  q2 = P.inc(2, 4)
+  assert_true("and so it is with another number of buffers",
+              T.pipeline_count == count + 2, "#{T.pipeline_count} pipelines, #{count} before")
+  q3 = P.inc(1, 8)
+  assert_true("each of them is found again", T.pipeline_count == count + 2,
+              "#{T.pipeline_count} pipelines, #{count} before")
+  assert_raise_message("each handle keeps its own label", ArgumentError, "second") do
+    p2.inc(x, 8)
+  end
+  h = B.floats(3).write([1, 2, 3])
+  p1.inc(h)
+  p1.release
+  p2.inc(h)
+  assert_true("releasing one handle leaves the others of the same pipeline working",
+              h.read == [3.0, 4.0, 5.0] && T.pipeline_count == count + 2, h.read.inspect)
+  q1.release
+  assert_true("a cached pipeline stays while a handle is left", T.pipeline_count == count + 2,
+              "#{T.pipeline_count} pipelines")
+  q3.inc(h)
+  assert_true("and still runs", h.read == [4.0, 5.0, 6.0], h.read.inspect)
+  q3.release
+  assert_true("it goes with its last handle", T.pipeline_count == count + 1,
+              "#{T.pipeline_count} pipelines")
+
+  # Released while a recorded dispatch uses it, then asked for again before the batch has run.
+  r1 = P.inc(1, 8)
+  r1.inc(h)
+  r1.release
+  assert_true("a pipeline released with its dispatch pending no longer counts",
+              T.pending == 1 && T.pipeline_count == count + 1, "#{T.pipeline_count} pipelines")
+  r2 = P.inc(1, 8)
+  assert_true("asked for again before the batch has run, it is taken back from the cache",
+              T.pending == 1 && T.pipeline_count == count + 2, "#{T.pipeline_count} pipelines")
+  assert_true("the pending dispatch runs", h.read == [5.0, 6.0, 7.0], h.read.inspect)
+  r2.inc(h)
+  assert_true("and the pipeline outlives that batch", h.read == [6.0, 7.0, 8.0] &&
+              T.pipeline_count == count + 2, h.read.inspect)
+  r2.inc(h)
+  r2.release
+  assert_true("released with a dispatch pending and not asked for again, it runs and is destroyed",
+              h.read == [7.0, 8.0, 9.0] && T.pipeline_count == count + 1, h.read.inspect)
+  q2.release
+  p2.release
+  assert_true("with every handle released, the count is back where it was",
+              T.pipeline_count == count, "#{T.pipeline_count} pipelines, #{count} before")
+  assert_true("the test gem's own handle to the shared pipeline still works",
+              T.inc(h).read == [8.0, 9.0, 10.0], h.read.inspect)
+  P.inc(1, 12)                             # never released: the GC frees it after the device is gone
 
   # -- many buffers come and go with a batch pending --
   acc = B.floats(4).write([0, 0, 0, 0])

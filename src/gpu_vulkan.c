@@ -3,7 +3,8 @@
  * Moved from mruby-gpu-narray (src/gpu_vulkan.c), which had it from
  * yujiteshima/mruby-gpu. The initialization and dispatch logic is unchanged.
  * What stayed behind in narray is its own table of built-in pipelines: the
- * runtime knows the three descriptor layouts, not which shaders use them.
+ * runtime makes the layout a gem describes, and does not know which shaders
+ * use it.
  */
 #include "gpu_internal.h"
 #include <mruby/error.h>
@@ -145,17 +146,141 @@ static int has_device_ext(VkPhysicalDevice dev, const char *name) {
   return found;
 }
 
+/* ---- Layouts ----
+ *
+ * A description is three numbers, so a layout is found by comparing them.
+ * Storage buffers take bindings 0 .. storage_buffers - 1 and uniform buffers
+ * the bindings after them, all in set 0. */
+
+/* Descriptors of one type the pool should hold when the widest layout binds
+ * `per_set` of them. */
+static uint32_t pool_want(uint32_t per_set) {
+  uint64_t full_batch = (uint64_t)per_set * GPU_MAX_DESC_SETS;
+  uint64_t few_sets   = (uint64_t)per_set * GPU_POOL_MIN_SETS;
+  uint64_t n = full_batch <= GPU_POOL_DESCRIPTORS ? full_batch
+             : few_sets   >  GPU_POOL_DESCRIPTORS ? few_sets
+             : GPU_POOL_DESCRIPTORS;
+  return n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
+}
+
+GpuLayout *gpu_layout_get(uint32_t storage_buffers, uint32_t uniform_buffers,
+                          uint32_t push_constant_size,
+                          VkResult *result, const char **step) {
+  *result = VK_SUCCESS;
+  *step = NULL;
+  for (GpuLayout *l = g_ctx.layouts; l; l = l->next) {
+    if (l->storage_buffers == storage_buffers && l->uniform_buffers == uniform_buffers &&
+        l->push_constant_size == push_constant_size) {
+      return l;
+    }
+  }
+
+  /* 64-bit: the two counts are each within a device limit, and some devices
+   * report limits near UINT32_MAX. */
+  uint64_t count = (uint64_t)storage_buffers + uniform_buffers;
+  *step = "allocating the layout";
+  *result = VK_ERROR_OUT_OF_HOST_MEMORY;
+  if (count > UINT32_MAX / sizeof(VkWriteDescriptorSet)) return NULL;
+
+  /* The scratch arrays dispatch_pipeline fills for one set. Grown here so
+   * that a dispatch never allocates. */
+  if (count > g_ctx.set_cap) {
+    VkDescriptorBufferInfo *infos = realloc(g_ctx.set_infos, count * sizeof(*infos));
+    if (!infos) return NULL;
+    g_ctx.set_infos = infos;
+    VkWriteDescriptorSet *writes = realloc(g_ctx.set_writes, count * sizeof(*writes));
+    if (!writes) return NULL;
+    g_ctx.set_writes = writes;
+    g_ctx.set_cap = (uint32_t)count;
+  }
+
+  if (push_constant_size > g_ctx.push_scratch_cap) {
+    unsigned char *scratch = realloc(g_ctx.push_scratch, push_constant_size);
+    if (!scratch) return NULL;
+    g_ctx.push_scratch = scratch;
+    g_ctx.push_scratch_cap = push_constant_size;
+  }
+
+  GpuLayout *l = calloc(1, sizeof(*l));
+  VkDescriptorSetLayoutBinding *bindings = malloc((count ? count : 1) * sizeof(*bindings));
+  if (!l || !bindings) {
+    free(l);
+    free(bindings);
+    return NULL;
+  }
+  l->storage_buffers = storage_buffers;
+  l->uniform_buffers = uniform_buffers;
+  l->push_constant_size = push_constant_size;
+
+  for (uint32_t i = 0; i < (uint32_t)count; i++) {
+    bindings[i] = (VkDescriptorSetLayoutBinding){
+      .binding = i,
+      .descriptorType = i < storage_buffers ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                            : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
+    };
+  }
+  VkDescriptorSetLayoutCreateInfo dl_info = {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+    .bindingCount = (uint32_t)count,
+    .pBindings = bindings
+  };
+  *step = "creating the descriptor-set layout";
+  *result = vkCreateDescriptorSetLayout(g_ctx.device, &dl_info, NULL, &l->desc_layout);
+  free(bindings);
+  if (*result != VK_SUCCESS) {
+    free(l);
+    return NULL;
+  }
+
+  /* The range is exactly what the description says. A shader whose
+   * push-constant block is larger than that does not fit the layout. */
+  VkPushConstantRange push_range = {
+    .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+    .offset = 0,
+    .size = push_constant_size
+  };
+  VkPipelineLayoutCreateInfo pl_info = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+    .setLayoutCount = 1,
+    .pSetLayouts = &l->desc_layout,
+    .pushConstantRangeCount = push_constant_size ? 1 : 0,
+    .pPushConstantRanges = push_constant_size ? &push_range : NULL
+  };
+  *step = "creating the pipeline layout";
+  *result = vkCreatePipelineLayout(g_ctx.device, &pl_info, NULL, &l->pipe_layout);
+  if (*result != VK_SUCCESS) {
+    vkDestroyDescriptorSetLayout(g_ctx.device, l->desc_layout, NULL);
+    free(l);
+    return NULL;
+  }
+
+  /* The pool has to hold sets of this layout. It is replaced, if it is too
+   * small, when the next set is allocated (alloc_desc_set), not here: that
+   * needs a flush, and creating a pipeline should not run the batch. */
+  uint32_t want = pool_want(storage_buffers);
+  if (want > g_ctx.want_storage) g_ctx.want_storage = want;
+  want = pool_want(uniform_buffers);
+  if (want > g_ctx.want_uniform) g_ctx.want_uniform = want;
+
+  l->next = g_ctx.layouts;
+  g_ctx.layouts = l;
+  *step = NULL;
+  return l;
+}
+
 /* ---- Pipelines ----
  *
- * A pipeline is created against one of the fixed layouts, so the caller only
- * brings the SPIR-V. Failures are returned rather than raised: mruby-gpu-narray
- * builds all of its pipelines at once and reports a missing or rejected
- * shader only when an operation needs it. */
-VkResult gpu_create_pipeline(const uint32_t *code, size_t size, LayoutId lid,
+ * A pipeline is created against a layout, so the caller only brings the
+ * SPIR-V. Failures are returned rather than raised: mruby-gpu-narray builds
+ * all of its pipelines at once and reports a missing or rejected shader only
+ * when an operation needs it. */
+VkResult gpu_create_pipeline(const uint32_t *code, size_t size, const GpuLayout *layout,
                              VkPipeline *out) {
   *out = VK_NULL_HANDLE;
   if (!g_ctx.initialized) return VK_ERROR_INITIALIZATION_FAILED;
-  if (lid < 0 || lid >= LAYOUT_COUNT) return VK_ERROR_UNKNOWN;
+  if (!layout) return VK_ERROR_UNKNOWN;
 
   VkShaderModuleCreateInfo sm_info = {
     .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -174,7 +299,7 @@ VkResult gpu_create_pipeline(const uint32_t *code, size_t size, LayoutId lid,
       .module = shader,
       .pName = "main"
     },
-    .layout = g_ctx.pipe_layouts[lid]
+    .layout = layout->pipe_layout
   };
   r = vkCreateComputePipelines(g_ctx.device, VK_NULL_HANDLE, 1, &cp_info, NULL, out);
   vkDestroyShaderModule(g_ctx.device, shader, NULL);
@@ -214,15 +339,48 @@ static void batch_begin(mrb_state *mrb, const char *op) {
   g_ctx.batch_recording = 1;
 }
 
+/* A descriptor pool for GPU_MAX_DESC_SETS sets and the given number of
+ * descriptors of each type. */
+static VkResult create_desc_pool(uint32_t storage, uint32_t uniform, VkDescriptorPool *out) {
+  VkDescriptorPoolSize sizes[2];
+  uint32_t count = 0;
+  if (storage) sizes[count++] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, storage};
+  if (uniform) sizes[count++] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, uniform};
+  VkDescriptorPoolCreateInfo dp_info = {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+    .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+    .maxSets = GPU_MAX_DESC_SETS,
+    .poolSizeCount = count,
+    .pPoolSizes = sizes
+  };
+  return vkCreateDescriptorPool(g_ctx.device, &dp_info, NULL, out);
+}
+
 /* One descriptor set from the pool. A full pool just means the batch is
- * flushed a little early: the sets it held are released by the reset. */
-static VkDescriptorSet alloc_desc_set(mrb_state *mrb, LayoutId lid, const char *op) {
-  if (g_ctx.batch_sets >= GPU_MAX_DESC_SETS) gpu_flush(mrb);
+ * flushed a little early: the sets it held are released by the reset. A pool
+ * that is too small for the layouts created since it was made is replaced
+ * first, which also needs the batch to have run. */
+static VkDescriptorSet alloc_desc_set(mrb_state *mrb, const GpuLayout *layout, const char *op) {
+  if (g_ctx.pool_storage < g_ctx.want_storage || g_ctx.pool_uniform < g_ctx.want_uniform) {
+    gpu_flush(mrb);   /* the recorded dispatches use sets of the old pool */
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkResult pr = create_desc_pool(g_ctx.want_storage, g_ctx.want_uniform, &pool);
+    if (pr != VK_SUCCESS) gpu_fail(mrb, pr, "vkCreateDescriptorPool", op);
+    vkDestroyDescriptorPool(g_ctx.device, g_ctx.desc_pool, NULL);
+    g_ctx.desc_pool = pool;
+    g_ctx.pool_storage = g_ctx.want_storage;
+    g_ctx.pool_uniform = g_ctx.want_uniform;
+  }
+  if (g_ctx.batch_sets >= GPU_MAX_DESC_SETS ||
+      layout->storage_buffers > g_ctx.pool_storage - g_ctx.batch_storage ||
+      layout->uniform_buffers > g_ctx.pool_uniform - g_ctx.batch_uniform) {
+    gpu_flush(mrb);
+  }
   VkDescriptorSetAllocateInfo dsai = {
     .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
     .descriptorPool = g_ctx.desc_pool,
     .descriptorSetCount = 1,
-    .pSetLayouts = &g_ctx.desc_layouts[lid]
+    .pSetLayouts = &layout->desc_layout
   };
   VkDescriptorSet set = VK_NULL_HANDLE;
   VkResult r = vkAllocateDescriptorSets(g_ctx.device, &dsai, &set);
@@ -237,12 +395,14 @@ static VkDescriptorSet alloc_desc_set(mrb_state *mrb, LayoutId lid, const char *
   }
   if (r != VK_SUCCESS) gpu_fail(mrb, r, "vkAllocateDescriptorSets", op);
   g_ctx.batch_sets++;
+  g_ctx.batch_storage += layout->storage_buffers;
+  g_ctx.batch_uniform += layout->uniform_buffers;
   return set;
 }
 
 void dispatch_pipeline(
-    mrb_state *mrb, VkPipeline pipeline, LayoutId lid,
-    GpuBuffer **bufs, int num_buffers,
+    mrb_state *mrb, VkPipeline pipeline, const GpuLayout *layout,
+    GpuBuffer **bufs, GpuBuffer **uniforms,
     const void *push_data, uint32_t push_size,
     uint32_t group_x, uint32_t group_y, uint32_t group_z,
     const char *label)
@@ -264,8 +424,17 @@ void dispatch_pipeline(
   if (pipeline == VK_NULL_HANDLE) {
     GPU_RAISE(mrb, GPU_RT_ERROR_GENERIC, "dispatch of a pipeline that was never created");
   }
-  if (num_buffers < 1 || num_buffers > 3) {
-    mrb_raisef(mrb, E_ARGUMENT_ERROR, "dispatch takes 1..3 buffers, got %d", num_buffers);
+  const uint32_t num_storage = layout->storage_buffers;
+  const uint32_t num_buffers = num_storage + layout->uniform_buffers;
+
+  /* Keep the batch within its push-constant budget (GPU_BATCH_PUSH_BYTES).
+   * A flush here is one more early sync point. */
+  if (push_size > 0) {
+    uint32_t block = push_size > g_ctx.batch_push_max ? push_size : g_ctx.batch_push_max;
+    uint32_t first = g_ctx.batch_push_bytes ? g_ctx.batch_push_first : block;
+    /* Where this block would end, counted as in the comment at the macro. */
+    uint64_t end = (uint64_t)g_ctx.batch_push_bytes + block - first + block;
+    if (end > GPU_BATCH_PUSH_BYTES) gpu_flush(mrb);
   }
 
   /* What a Vulkan failure below is reported under: the same prefix as the
@@ -273,18 +442,22 @@ void dispatch_pipeline(
   char op[96];
   snprintf(op, sizeof(op), "gpu_rt_dispatch(%s)", label ? label : "unnamed");
 
-  VkDescriptorSet desc_set = alloc_desc_set(mrb, lid, op);
+  VkDescriptorSet desc_set = alloc_desc_set(mrb, layout, op);
 
-  VkDescriptorBufferInfo buf_infos[3];
-  VkWriteDescriptorSet writes[3];
-  for (int i = 0; i < num_buffers; i++) {
-    buf_infos[i] = (VkDescriptorBufferInfo){bufs[i]->buffer, 0, bufs[i]->bytes};
+  /* One write per binding: storage buffers first, then uniform buffers. The
+   * arrays are as wide as the widest layout (gpu_layout_get). */
+  VkDescriptorBufferInfo *buf_infos = g_ctx.set_infos;
+  VkWriteDescriptorSet *writes = g_ctx.set_writes;
+  for (uint32_t i = 0; i < num_buffers; i++) {
+    GpuBuffer *b = i < num_storage ? bufs[i] : uniforms[i - num_storage];
+    buf_infos[i] = (VkDescriptorBufferInfo){b->buffer, 0, b->bytes};
     writes[i] = (VkWriteDescriptorSet){
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
       .dstSet = desc_set,
       .dstBinding = i,
       .descriptorCount = 1,
-      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      .descriptorType = i < num_storage ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                        : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
       .pBufferInfo = &buf_infos[i]
     };
   }
@@ -294,12 +467,32 @@ void dispatch_pipeline(
   VkCommandBuffer cmd = g_ctx.batch_cmd;
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-    g_ctx.pipe_layouts[lid], 0, 1, &desc_set, 0, NULL);
+    layout->pipe_layout, 0, 1, &desc_set, 0, NULL);
   if (push_size > 0) {
-    vkCmdPushConstants(cmd, g_ctx.pipe_layouts[lid], VK_SHADER_STAGE_COMPUTE_BIT,
+    if (push_size > g_ctx.batch_push_max) {
+      /* The first block of this size in the batch is pushed twice: first
+       * with every bit inverted, then as it is. Mesa V3DV (25.2.8) ignores a
+       * vkCmdPushConstants whose bytes equal what it already holds, and
+       * forgets to note that the block grew. All zeroes at the start of a
+       * command buffer, or a block whose start repeats a smaller one and
+       * whose rest is zero, would then be only partly copied for a shader
+       * that indexes its push constants, which reads stale bytes instead.
+       * One of two blocks that differ in every byte cannot be ignored. */
+      const unsigned char *src = (const unsigned char *)push_data;
+      for (uint32_t i = 0; i < push_size; i++) g_ctx.push_scratch[i] = (unsigned char)~src[i];
+      vkCmdPushConstants(cmd, layout->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+        0, push_size, g_ctx.push_scratch);
+    }
+    vkCmdPushConstants(cmd, layout->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
       0, push_size, push_data);
   }
   vkCmdDispatch(cmd, group_x, group_y, group_z);
+  if (push_size > 0) {
+    /* After a flush above, or in alloc_desc_set, both numbers are 0 again. */
+    if (push_size > g_ctx.batch_push_max) g_ctx.batch_push_max = push_size;
+    if (g_ctx.batch_push_bytes == 0) g_ctx.batch_push_first = g_ctx.batch_push_max;
+    g_ctx.batch_push_bytes += g_ctx.batch_push_max;
+  }
 
   /* Make this dispatch's writes visible to whatever is recorded next. One
    * global barrier per dispatch is coarser than tracking buffers one by one,
@@ -313,7 +506,8 @@ void dispatch_pipeline(
     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
     0, 1, &barrier, 0, NULL, 0, NULL);
 
-  for (int i = 0; i < num_buffers; i++) bufs[i]->epoch = g_ctx.epoch;
+  for (uint32_t i = 0; i < num_storage; i++) bufs[i]->epoch = g_ctx.epoch;
+  for (uint32_t i = num_storage; i < num_buffers; i++) uniforms[i - num_storage]->epoch = g_ctx.epoch;
   g_ctx.batch_dispatches++;
 
   if (g_ctx.eager) gpu_flush(mrb);
@@ -363,9 +557,14 @@ void gpu_flush(mrb_state *mrb) {
   /* No work is pending from here on (either it completed or it never left
    * the host), so the sets and the graveyard can go. */
   g_ctx.batch_dispatches = 0;
+  g_ctx.batch_push_bytes = 0;
+  g_ctx.batch_push_max = 0;
+  g_ctx.batch_push_first = 0;
   if (g_ctx.batch_sets > 0) {
     vkResetDescriptorPool(g_ctx.device, g_ctx.desc_pool, 0);
     g_ctx.batch_sets = 0;
+    g_ctx.batch_storage = 0;
+    g_ctx.batch_uniform = 0;
   }
   g_ctx.epoch++;
   bury_graveyard(mrb);
@@ -655,6 +854,24 @@ void gpu_init(mrb_state *mrb) {
   g_ctx.max_workgroups = dev_props.limits.maxComputeWorkGroupCount[0];
   g_ctx.device_type = dev_props.deviceType;
 
+  /* What one layout may bind (gpu_rt_pipeline_create checks a description
+   * against these). All of a layout's bindings are in one set and one stage,
+   * so the smaller of the per-set and the per-stage limit counts. */
+  const VkPhysicalDeviceLimits *lim = &dev_props.limits;
+  g_ctx.max_bindings = lim->maxPerStageResources;
+  g_ctx.max_storage_buffers = lim->maxPerStageDescriptorStorageBuffers;
+  if (lim->maxDescriptorSetStorageBuffers < g_ctx.max_storage_buffers) {
+    g_ctx.max_storage_buffers = lim->maxDescriptorSetStorageBuffers;
+  }
+  if (g_ctx.max_bindings < g_ctx.max_storage_buffers) g_ctx.max_storage_buffers = g_ctx.max_bindings;
+  g_ctx.max_uniform_buffers = lim->maxPerStageDescriptorUniformBuffers;
+  if (lim->maxDescriptorSetUniformBuffers < g_ctx.max_uniform_buffers) {
+    g_ctx.max_uniform_buffers = lim->maxDescriptorSetUniformBuffers;
+  }
+  if (g_ctx.max_bindings < g_ctx.max_uniform_buffers) g_ctx.max_uniform_buffers = g_ctx.max_bindings;
+  g_ctx.max_push_constant_size = lim->maxPushConstantsSize & ~3u;   /* a range is whole words */
+  g_ctx.max_uniform_buffer_size = lim->maxUniformBufferRange;
+
   /* Queue Family (compute) */
   uint32_t qf_count = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(g_ctx.physical_device, &qf_count, NULL);
@@ -787,60 +1004,20 @@ void gpu_init(mrb_state *mrb) {
   g_ctx.batch_recording = 0;
   g_ctx.batch_dispatches = 0;
   g_ctx.batch_sets = 0;
+  g_ctx.batch_push_bytes = 0;
+  g_ctx.batch_push_max = 0;
+  g_ctx.batch_push_first = 0;
   g_ctx.epoch = 1;   /* a fresh buffer carries epoch 0, which never matches */
 
-  /* Descriptor Set Layouts: 3, 2 and 1 storage buffers respectively */
-  int buf_counts[LAYOUT_COUNT] = {3, 2, 1};
-  for (int l = 0; l < LAYOUT_COUNT; l++) {
-    VkDescriptorSetLayoutBinding bindings[3];
-    for (int i = 0; i < buf_counts[l]; i++) {
-      bindings[i] = (VkDescriptorSetLayoutBinding){
-        .binding = i,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
-      };
-    }
-    VkDescriptorSetLayoutCreateInfo dl_info = {
-      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = buf_counts[l],
-      .pBindings = bindings
-    };
-    VK_CHECK(mrb, vkCreateDescriptorSetLayout(g_ctx.device, &dl_info, NULL,
-                                              &g_ctx.desc_layouts[l]));
-  }
-
-  /* Pipeline Layouts (one per descriptor layout, shared push constant range) */
-  VkPushConstantRange push_range = {
-    .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-    .offset = 0,
-    .size = GPU_PUSH_CONSTANT_SIZE
-  };
-  for (int l = 0; l < LAYOUT_COUNT; l++) {
-    VkPipelineLayoutCreateInfo pl_info = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-      .setLayoutCount = 1,
-      .pSetLayouts = &g_ctx.desc_layouts[l],
-      .pushConstantRangeCount = 1,
-      .pPushConstantRanges = &push_range
-    };
-    VK_CHECK(mrb, vkCreatePipelineLayout(g_ctx.device, &pl_info, NULL,
-                                         &g_ctx.pipe_layouts[l]));
-  }
-
-  /* Descriptor Pool */
-  VkDescriptorPoolSize pool_size = {
-    .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-    .descriptorCount = 3 * GPU_MAX_DESC_SETS
-  };
-  VkDescriptorPoolCreateInfo dp_info = {
-    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-    .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-    .maxSets = GPU_MAX_DESC_SETS,
-    .poolSizeCount = 1,
-    .pPoolSizes = &pool_size
-  };
-  VK_CHECK(mrb, vkCreateDescriptorPool(g_ctx.device, &dp_info, NULL, &g_ctx.desc_pool));
+  /* Descriptor Pool. Layouts are created when pipelines ask for them
+   * (gpu_layout_get). Until one asks for more, the pool holds what a full
+   * batch of three-buffer sets needs, and no uniform-buffer descriptors. */
+  g_ctx.layouts = NULL;
+  g_ctx.want_storage = g_ctx.pool_storage = 3 * GPU_MAX_DESC_SETS;
+  g_ctx.want_uniform = g_ctx.pool_uniform = 0;
+  g_ctx.batch_storage = g_ctx.batch_uniform = 0;
+  gpu_check(mrb, create_desc_pool(g_ctx.pool_storage, g_ctx.pool_uniform, &g_ctx.desc_pool),
+            "vkCreateDescriptorPool");
 
   g_ctx.initialized = 1;
   g_ctx.init_failed = 0;
@@ -878,10 +1055,21 @@ void gpu_shutdown(mrb_state *mrb) {
   g_ctx.graveyard_cap = 0;
   vkDestroyFence(g_ctx.device, g_ctx.batch_fence, NULL);
   vkDestroyDescriptorPool(g_ctx.device, g_ctx.desc_pool, NULL);
-  for (int l = 0; l < LAYOUT_COUNT; l++) {
-    vkDestroyPipelineLayout(g_ctx.device, g_ctx.pipe_layouts[l], NULL);
-    vkDestroyDescriptorSetLayout(g_ctx.device, g_ctx.desc_layouts[l], NULL);
+  for (GpuLayout *l = g_ctx.layouts, *next; l; l = next) {
+    next = l->next;
+    vkDestroyPipelineLayout(g_ctx.device, l->pipe_layout, NULL);
+    vkDestroyDescriptorSetLayout(g_ctx.device, l->desc_layout, NULL);
+    free(l);
   }
+  g_ctx.layouts = NULL;
+  free(g_ctx.set_infos);
+  free(g_ctx.set_writes);
+  g_ctx.set_infos = NULL;
+  g_ctx.set_writes = NULL;
+  g_ctx.set_cap = 0;
+  free(g_ctx.push_scratch);
+  g_ctx.push_scratch = NULL;
+  g_ctx.push_scratch_cap = 0;
   vkDestroyCommandPool(g_ctx.device, g_ctx.cmd_pool, NULL);
   vkDestroyDevice(g_ctx.device, NULL);
   vkDestroyInstance(g_ctx.instance, NULL);
